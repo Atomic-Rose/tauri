@@ -2029,6 +2029,16 @@ impl<T: UserEvent> CefRuntime<T> {
       }
     }
     command_line_args.push(("--enable-media-stream".to_string(), None));
+    // Force CEF to use the X11 backend on Linux. Native Ozone Wayland returns
+    // a bogus xid from host.window_handle(), which crashes the X11-only
+    // start_window_dragging path in cef_impl.rs with BadWindow on the first
+    // XQueryPointer. Running CEF through XWayland gives us a real X11 window
+    // and lets the existing drag/move code work on Wayland sessions.
+    #[cfg(target_os = "linux")]
+    command_line_args.push((
+      "--ozone-platform".to_string(),
+      Some("x11".to_string()),
+    ));
 
     let mut app = cef_impl::TauriApp::new(
       cef_context.clone(),
