@@ -3489,6 +3489,15 @@ pub(crate) fn create_window<T: UserEvent>(
 
   let window = window_create_top_level(Some(&mut delegate)).expect("Failed to create window");
 
+  // 2026-04-19 spike: set_draggable_regions DOES trigger Wayland interactive
+  // move, but the rest of webview input breaks under native Ozone Wayland for
+  // frameless windows. See note in lib.rs near --ozone-platform=x11. Leaving
+  // this commented as a record of the API shape for future revisits.
+  // window.set_draggable_regions(Some(&[cef::DraggableRegion {
+  //   bounds: cef::Rect { x: 0, y: 0, width: 8192, height: 64 },
+  //   draggable: 1,
+  // }]));
+
   context.windows.borrow_mut().insert(
     window_id,
     AppWindow {

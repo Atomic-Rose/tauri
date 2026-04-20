@@ -2034,6 +2034,13 @@ impl<T: UserEvent> CefRuntime<T> {
     // start_window_dragging path in cef_impl.rs with BadWindow on the first
     // XQueryPointer. Running CEF through XWayland gives us a real X11 window
     // and lets the existing drag/move code work on Wayland sessions.
+    //
+    // 2026-04-19 spike (branch experiment/cef-native-drag): tried disabling this
+    // and using cef::ImplWindow::set_draggable_regions instead. Drag and
+    // double-click-maximize worked natively, but ALL other webview input broke
+    // (toolbar buttons, settings, panels — clicks silently dropped). Likely an
+    // upstream Chromium Ozone Wayland issue with frameless Views windows. The
+    // XWayland workaround was hiding more than just the drag crash.
     #[cfg(target_os = "linux")]
     command_line_args.push((
       "--ozone-platform".to_string(),
