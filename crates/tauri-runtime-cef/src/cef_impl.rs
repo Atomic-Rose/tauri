@@ -2328,7 +2328,7 @@ fn start_window_dragging(app_window: &crate::AppWindow) {
           .browser()
           .and_then(|browser| browser.host())
           .map(|host| host.window_handle())
-          .filter(|handle| *handle != 0)
+          .filter(|handle| !handle.is_null())
       })
       .or_else(|| app_window.window().map(|window| window.window_handle()));
     let ns_view = ns_view_handle.and_then(|handle| Retained::<NSView>::retain(handle as _));
