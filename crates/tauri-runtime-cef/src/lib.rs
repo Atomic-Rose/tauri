@@ -1948,6 +1948,119 @@ fn is_cef_helper_process() -> bool {
 
 impl<T: UserEvent> CefRuntime<T> {
   fn init(runtime_args: RuntimeInitArgs<RuntimeInitAttribute>) -> Self {
+    // On macOS, CEF's ICU initialization calls [NSBundle mainBundle] before
+    // CefSettings are applied. For a bare binary (outside an .app bundle),
+    // mainBundle returns the binary's directory, which has no icudtl.dat.
+    //
+    // Fix: if we're not already inside a .app bundle, create a minimal fake
+    // bundle next to the binary and re-exec from within it. After re-exec,
+    // [NSBundle mainBundle] auto-detects the .app bundle and CEF finds ICU.
+    #[cfg(target_os = "macos")]
+    {
+      use std::os::unix::process::CommandExt;
+      let exe = std::env::current_exe().expect("cannot get current exe path");
+      let already_bundled = exe
+        .to_str()
+        .map(|p| p.contains(".app/Contents/MacOS/"))
+        .unwrap_or(false);
+      eprintln!("[cef-bundle] exe={} already_bundled={}", exe.display(), already_bundled);
+      if !already_bundled {
+        let exe_dir = exe.parent().expect("exe has no parent directory");
+        let fake_bundle = exe_dir.join("muse.app");
+        let bundle_macos = fake_bundle.join("Contents/MacOS");
+        let bundle_frameworks = fake_bundle.join("Contents/Frameworks");
+        std::fs::create_dir_all(&bundle_macos).expect("cannot create fake bundle MacOS dir");
+        std::fs::create_dir_all(&bundle_frameworks)
+          .expect("cannot create fake bundle Frameworks dir");
+
+        // Find the real CEF framework. The build sets up target/Frameworks/ as
+        // a symlink to the CEF installation; canonicalize through it to get the
+        // absolute path so every subsequent symlink is non-relative.
+        let cef_symlink =
+          exe_dir.join("../Frameworks/Chromium Embedded Framework.framework");
+        let real_framework = cef_symlink
+          .canonicalize()
+          .unwrap_or_else(|_| {
+            // Fall back to cef_dll_sys for the CEF dir when ../Frameworks/ is absent.
+            cef_dll_sys::get_cef_dir()
+              .expect("cannot locate CEF directory")
+              .join("Chromium Embedded Framework.framework")
+              .canonicalize()
+              .expect("cannot canonicalize CEF framework path")
+          });
+
+        // Symlink the CEF framework into the bundle's Frameworks dir. Always
+        // recreate so stale symlinks from prior builds are fixed automatically.
+        let cef_link = bundle_frameworks.join("Chromium Embedded Framework.framework");
+        let _ = std::fs::remove_file(&cef_link); // remove stale symlink if any
+        std::os::unix::fs::symlink(&real_framework, &cef_link)
+          .expect("cannot symlink CEF framework into fake bundle");
+
+        // CEF's ICU init uses [NSBundle mainBundle].pathForResource:@"icudtl"
+        // which searches <bundle>/Contents/Resources/. Symlink that directory
+        // to the CEF framework's Resources so the lookup succeeds.
+        let bundle_resources = fake_bundle.join("Contents/Resources");
+        let cef_resources = real_framework.join("Resources");
+        let _ = std::fs::remove_file(&bundle_resources); // remove stale symlink if any
+        std::os::unix::fs::symlink(&cef_resources, &bundle_resources)
+          .expect("cannot symlink CEF resources into fake bundle");
+
+        // A minimal Info.plist is required for NSBundle to recognise muse.app
+        // as a proper app bundle and return the correct resourcePath.
+        let info_plist = fake_bundle.join("Contents/Info.plist");
+        if !info_plist.exists() {
+          std::fs::write(
+            &info_plist,
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>muse</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.muse.desktop</string>
+    <key>CFBundleName</key>
+    <string>muse</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+</dict>
+</plist>"#,
+          )
+          .expect("cannot write fake bundle Info.plist");
+        }
+
+        // Copy the binary into the bundle (hardlinks break on cargo rebuild
+        // because cargo does atomic rename; a fresh copy is ~100ms and ensures
+        // the bundle binary is always current).
+        let bundle_exe = bundle_macos.join("muse");
+        let needs_copy = !bundle_exe.exists() || {
+          let exe_meta = std::fs::metadata(&exe).ok();
+          let bun_meta = std::fs::metadata(&bundle_exe).ok();
+          exe_meta
+            .and_then(|m| m.modified().ok())
+            .zip(bun_meta.and_then(|m| m.modified().ok()))
+            .map(|(e, b)| e != b)
+            .unwrap_or(true)
+        };
+        if needs_copy {
+          std::fs::copy(&exe, &bundle_exe).expect("cannot copy binary into fake bundle");
+        }
+
+        // Re-exec from within the bundle.
+        // Clear CFProcessPath so Core Foundation auto-detects the main bundle
+        // from the new executable path rather than inheriting the value from
+        // the parent process (e.g. the Tauri dev runner).
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let err = std::process::Command::new(&bundle_exe)
+          .args(&args[1..])
+          .env_remove("CFProcessPath")
+          .exec();
+        panic!("re-exec failed: {err}");
+      }
+    }
+
     let args = cef::args::Args::new();
 
     let (event_tx, event_rx) = channel();
@@ -2072,11 +2185,58 @@ impl<T: UserEvent> CefRuntime<T> {
       std::process::exit(0);
     }
 
-    let settings = cef::Settings {
+    let mut settings = cef::Settings {
       no_sandbox: !cfg!(feature = "sandbox") as i32,
       cache_path: cache_path.to_string_lossy().to_string().as_str().into(),
       ..Default::default()
     };
+
+    // On macOS, set the explicit framework and resource paths so CEF doesn't
+    // have to guess. After the re-exec at the top of init(), we are always
+    // running from inside the fake .app bundle:
+    //   <bundle>/Contents/MacOS/muse          ← this process
+    //   <bundle>/Contents/Frameworks/CEF.framework → real CEF installation
+    //   <bundle>/Contents/Resources           → real CEF Resources/
+    //   <bundle>/Contents/Info.plist          ← minimal plist
+    #[cfg(target_os = "macos")]
+    {
+      let exe = std::env::current_exe().expect("cannot get current exe path");
+      let exe_dir = exe.parent().expect("exe has no parent directory");
+
+      // muse.app is three levels up from the exe (MacOS/ → Contents/ → .app/)
+      let bundle_path = exe_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("cannot derive bundle path from exe")
+        .to_path_buf();
+
+      // The CEF framework symlink lives in Contents/Frameworks/.
+      let framework_symlink =
+        exe_dir.join("../Frameworks/Chromium Embedded Framework.framework");
+      let real_framework = framework_symlink
+        .canonicalize()
+        .expect("cannot resolve CEF framework symlink inside bundle");
+      let real_frameworks_dir = real_framework
+        .parent()
+        .expect("CEF framework has no parent")
+        .to_path_buf();
+      let resources_dir = real_framework.join("Resources");
+
+      // Diagnostic: print what NSBundle will see so we can confirm ICU lookup.
+      let icu_path = bundle_path.join("Contents/Resources/icudtl.dat");
+      eprintln!("[cef-debug] bundle={}", bundle_path.display());
+      eprintln!("[cef-debug] CFProcessPath={:?}", std::env::var("CFProcessPath").ok());
+      eprintln!("[cef-debug] icudtl accessible={} path={}", icu_path.exists(), icu_path.display());
+
+      settings.browser_subprocess_path = exe.to_string_lossy().as_ref().into();
+      // framework_dir_path: real parent of the .framework (for CEF loading).
+      settings.framework_dir_path = real_frameworks_dir.to_string_lossy().as_ref().into();
+      // resources_dir_path: where CEF finds *.pak files.
+      settings.resources_dir_path = resources_dir.to_string_lossy().as_ref().into();
+      // main_bundle_path: set explicitly so CEF uses the fake bundle even if
+      // [NSBundle mainBundle] detection is unreliable in the dev environment.
+      settings.main_bundle_path = bundle_path.to_string_lossy().as_ref().into();
+    }
     assert_eq!(
       cef::initialize(
         Some(args.as_main_args()),
