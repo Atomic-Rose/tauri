@@ -2314,12 +2314,24 @@ fn handle_webview_message<T: UserEvent>(
 }
 
 #[cfg(target_os = "macos")]
-fn start_window_dragging(window: &cef::Window) {
+fn start_window_dragging(app_window: &crate::AppWindow) {
   use objc2::rc::Retained;
   use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType, NSView};
 
   unsafe {
-    let ns_view = Retained::<NSView>::retain(window.window_handle() as _);
+    let ns_view_handle = app_window
+      .webviews
+      .iter()
+      .find_map(|webview| {
+        webview
+          .inner
+          .browser()
+          .and_then(|browser| browser.host())
+          .map(|host| host.window_handle())
+          .filter(|handle| *handle != 0)
+      })
+      .or_else(|| app_window.window().map(|window| window.window_handle()));
+    let ns_view = ns_view_handle.and_then(|handle| Retained::<NSView>::retain(handle as _));
     if let Some(ns_view) = ns_view
       && let Some(ns_window) = ns_view.window()
     {
@@ -2373,10 +2385,14 @@ fn start_window_dragging(window: &cef::Window) {
 }
 
 #[cfg(windows)]
-fn start_window_dragging(window: &cef::Window) {
+fn start_window_dragging(app_window: &crate::AppWindow) {
   use windows::Win32::Foundation::*;
   use windows::Win32::UI::Input::KeyboardAndMouse::*;
   use windows::Win32::UI::WindowsAndMessaging::*;
+
+  let Some(window) = app_window.window() else {
+    return;
+  };
 
   unsafe {
     let hwnd = window.window_handle();
@@ -2407,7 +2423,57 @@ fn start_window_dragging(window: &cef::Window) {
   target_os = "netbsd",
   target_os = "openbsd"
 ))]
-fn start_window_dragging(window: &cef::Window) {
+fn resolve_dragging_window(
+  app_window: &crate::AppWindow,
+  xlib: &x11_dl::xlib::Xlib,
+  display: *mut x11_dl::xlib::Display,
+) -> Option<x11_dl::xlib::Window> {
+  let mut window = app_window.webviews.iter().find_map(|webview| {
+    webview
+      .inner
+      .browser()
+      .and_then(|browser| browser.host())
+      .map(|host| host.window_handle() as x11_dl::xlib::Window)
+      .filter(|xid| *xid > 1)
+  })?;
+
+  loop {
+    let mut root: x11_dl::xlib::Window = 0;
+    let mut parent: x11_dl::xlib::Window = 0;
+    let mut children: *mut x11_dl::xlib::Window = std::ptr::null_mut();
+    let mut child_count: std::ffi::c_uint = 0;
+
+    let status = unsafe {
+      (xlib.XQueryTree)(
+        display,
+        window,
+        &mut root,
+        &mut parent,
+        &mut children,
+        &mut child_count,
+      )
+    };
+
+    if !children.is_null() {
+      unsafe { (xlib.XFree)(children as *mut std::ffi::c_void) };
+    }
+
+    if status == 0 || parent == 0 || parent == root {
+      return Some(window);
+    }
+
+    window = parent;
+  }
+}
+
+#[cfg(any(
+  target_os = "linux",
+  target_os = "dragonfly",
+  target_os = "freebsd",
+  target_os = "netbsd",
+  target_os = "openbsd"
+))]
+fn start_window_dragging(app_window: &crate::AppWindow) {
   use std::ffi::CString;
   use std::os::raw::c_long;
   use x11_dl::xlib;
@@ -2422,7 +2488,10 @@ fn start_window_dragging(window: &cef::Window) {
       return;
     }
 
-    let win = window.window_handle();
+    let Some(win) = resolve_dragging_window(app_window, &xlib, display) else {
+      (xlib.XCloseDisplay)(display);
+      return;
+    };
 
     let mut root_x: std::ffi::c_int = 0;
     let mut root_y: std::ffi::c_int = 0;
@@ -2476,7 +2545,9 @@ fn start_window_dragging(window: &cef::Window) {
     };
 
     let mut event: xlib::XEvent = xclient.into();
-    let _ = (xlib.XSendEvent)(display, root, xlib::False, 0, &mut event);
+    let event_mask =
+      (xlib::SubstructureRedirectMask | xlib::SubstructureNotifyMask) as std::os::raw::c_long;
+    let _ = (xlib.XSendEvent)(display, root, xlib::False, event_mask, &mut event);
     (xlib.XFlush)(display);
     (xlib.XCloseDisplay)(display);
   }
@@ -3115,10 +3186,8 @@ fn handle_window_message<T: UserEvent>(
       }
     }
     WindowMessage::StartDragging => {
-      if let Some(app_window) = context.windows.borrow().get(&window_id)
-        && let Some(window) = app_window.window()
-      {
-        start_window_dragging(&window);
+      if let Some(app_window) = context.windows.borrow().get(&window_id) {
+        start_window_dragging(app_window);
       }
     }
     WindowMessage::StartResizeDragging(_direction) => {
