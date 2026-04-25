@@ -1946,6 +1946,26 @@ fn is_cef_helper_process() -> bool {
     .unwrap_or_default()
 }
 
+#[cfg(all(target_os = "macos", feature = "sandbox"))]
+fn cef_sandbox_library_path_from_current_exe() -> Option<std::path::PathBuf> {
+  let exe = std::env::current_exe().ok()?;
+  let parent = exe.parent()?;
+  let relative_path = if is_cef_helper_process() {
+    "../../../Chromium Embedded Framework.framework/Libraries/libcef_sandbox.dylib"
+  } else {
+    "../Frameworks/Chromium Embedded Framework.framework/Libraries/libcef_sandbox.dylib"
+  };
+
+  Some(parent.join(relative_path))
+}
+
+#[cfg(all(target_os = "macos", feature = "sandbox"))]
+fn cef_sandbox_library_available() -> bool {
+  cef_sandbox_library_path_from_current_exe()
+    .as_deref()
+    .is_some_and(std::path::Path::is_file)
+}
+
 impl<T: UserEvent> CefRuntime<T> {
   fn init(runtime_args: RuntimeInitArgs<RuntimeInitAttribute>) -> Self {
     // On macOS, CEF's ICU initialization calls [NSBundle mainBundle] before
@@ -1963,7 +1983,6 @@ impl<T: UserEvent> CefRuntime<T> {
         .to_str()
         .map(|p| p.contains(".app/Contents/MacOS/"))
         .unwrap_or(false);
-      eprintln!("[cef-bundle] exe={} already_bundled={}", exe.display(), already_bundled);
       if !already_bundled {
         let exe_dir = exe.parent().expect("exe has no parent directory");
         let fake_bundle = exe_dir.join("muse.app");
@@ -1976,18 +1995,15 @@ impl<T: UserEvent> CefRuntime<T> {
         // Find the real CEF framework. The build sets up target/Frameworks/ as
         // a symlink to the CEF installation; canonicalize through it to get the
         // absolute path so every subsequent symlink is non-relative.
-        let cef_symlink =
-          exe_dir.join("../Frameworks/Chromium Embedded Framework.framework");
-        let real_framework = cef_symlink
-          .canonicalize()
-          .unwrap_or_else(|_| {
-            // Fall back to cef_dll_sys for the CEF dir when ../Frameworks/ is absent.
-            cef_dll_sys::get_cef_dir()
-              .expect("cannot locate CEF directory")
-              .join("Chromium Embedded Framework.framework")
-              .canonicalize()
-              .expect("cannot canonicalize CEF framework path")
-          });
+        let cef_symlink = exe_dir.join("../Frameworks/Chromium Embedded Framework.framework");
+        let real_framework = cef_symlink.canonicalize().unwrap_or_else(|_| {
+          // Fall back to cef_dll_sys for the CEF dir when ../Frameworks/ is absent.
+          cef_dll_sys::get_cef_dir()
+            .expect("cannot locate CEF directory")
+            .join("Chromium Embedded Framework.framework")
+            .canonicalize()
+            .expect("cannot canonicalize CEF framework path")
+        });
 
         // Symlink the CEF framework into the bundle's Frameworks dir. Always
         // recreate so stale symlinks from prior builds are fixed automatically.
@@ -2071,7 +2087,7 @@ impl<T: UserEvent> CefRuntime<T> {
       let is_helper = is_cef_helper_process();
 
       #[cfg(feature = "sandbox")]
-      let sandbox = if is_helper {
+      let sandbox = if is_helper && cef_sandbox_library_available() {
         let mut sandbox = cef::sandbox::Sandbox::new();
         sandbox.initialize(args.as_main_args());
         Some(sandbox)
@@ -2155,10 +2171,7 @@ impl<T: UserEvent> CefRuntime<T> {
     // upstream Chromium Ozone Wayland issue with frameless Views windows. The
     // XWayland workaround was hiding more than just the drag crash.
     #[cfg(target_os = "linux")]
-    command_line_args.push((
-      "--ozone-platform".to_string(),
-      Some("x11".to_string()),
-    ));
+    command_line_args.push(("--ozone-platform".to_string(), Some("x11".to_string())));
 
     let mut app = cef_impl::TauriApp::new(
       cef_context.clone(),
@@ -2185,8 +2198,21 @@ impl<T: UserEvent> CefRuntime<T> {
       std::process::exit(0);
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut settings = cef::Settings {
+      #[cfg(not(target_os = "macos"))]
       no_sandbox: !cfg!(feature = "sandbox") as i32,
+      #[cfg(target_os = "macos")]
+      no_sandbox: {
+        #[cfg(feature = "sandbox")]
+        {
+          !cef_sandbox_library_available() as i32
+        }
+        #[cfg(not(feature = "sandbox"))]
+        {
+          1
+        }
+      },
       cache_path: cache_path.to_string_lossy().to_string().as_str().into(),
       ..Default::default()
     };
@@ -2211,26 +2237,42 @@ impl<T: UserEvent> CefRuntime<T> {
         .to_path_buf();
 
       // The CEF framework symlink lives in Contents/Frameworks/.
-      let framework_symlink =
-        exe_dir.join("../Frameworks/Chromium Embedded Framework.framework");
+      let framework_symlink = exe_dir.join("../Frameworks/Chromium Embedded Framework.framework");
       let real_framework = framework_symlink
         .canonicalize()
         .expect("cannot resolve CEF framework symlink inside bundle");
-      let real_frameworks_dir = real_framework
-        .parent()
-        .expect("CEF framework has no parent")
-        .to_path_buf();
       let resources_dir = real_framework.join("Resources");
 
-      // Diagnostic: print what NSBundle will see so we can confirm ICU lookup.
-      let icu_path = bundle_path.join("Contents/Resources/icudtl.dat");
-      eprintln!("[cef-debug] bundle={}", bundle_path.display());
-      eprintln!("[cef-debug] CFProcessPath={:?}", std::env::var("CFProcessPath").ok());
-      eprintln!("[cef-debug] icudtl accessible={} path={}", icu_path.exists(), icu_path.display());
-
-      settings.browser_subprocess_path = exe.to_string_lossy().as_ref().into();
-      // framework_dir_path: real parent of the .framework (for CEF loading).
-      settings.framework_dir_path = real_frameworks_dir.to_string_lossy().as_ref().into();
+      // browser_subprocess_path: when running from a fully-bundled .app, point
+      // at the cef-helper binary inside Contents/Frameworks/<name> Helper.app/.
+      // CEF on macOS spawns subprocesses (renderer, GPU, plugin, alerts) by
+      // appending " (TYPE)" to this base path. The helper-bundle exe sits at
+      // the depth where LibraryLoader's hardcoded `../../..` walk lands on
+      // Contents/Frameworks/. Pointing at the main exe instead makes that walk
+      // overshoot the bundle and panic with NotFound on the framework binary.
+      // Fall back to the main exe in dev mode (no helper bundles staged yet).
+      let exe_name = exe
+        .file_name()
+        .expect("exe has no file name")
+        .to_string_lossy()
+        .to_string();
+      let helper_exe = bundle_path
+        .join("Contents/Frameworks")
+        .join(format!("{exe_name} Helper.app"))
+        .join("Contents/MacOS")
+        .join(format!("{exe_name} Helper"));
+      let subprocess_path = if helper_exe.is_file() {
+        helper_exe
+      } else {
+        exe.clone()
+      };
+      settings.browser_subprocess_path = subprocess_path.to_string_lossy().as_ref().into();
+      // framework_dir_path: full path to the .framework itself. CEF uses this
+      // for base::apple::SetOverrideFrameworkBundlePath, and ICU init then
+      // calls [FrameworkBundle URLForResource:@"icudtl"] against it. Passing
+      // the parent directory makes [NSBundle bundleWithPath:] return nil and
+      // ICU falls back to the main bundle, where icudtl.dat is not present.
+      settings.framework_dir_path = real_framework.to_string_lossy().as_ref().into();
       // resources_dir_path: where CEF finds *.pak files.
       settings.resources_dir_path = resources_dir.to_string_lossy().as_ref().into();
       // main_bundle_path: set explicitly so CEF uses the fake bundle even if
@@ -2267,11 +2309,11 @@ pub fn run_cef_helper_process() {
   let args = cef::args::Args::new();
 
   #[cfg(all(target_os = "macos", feature = "sandbox"))]
-  let _sandbox = {
+  let _sandbox = cef_sandbox_library_available().then(|| {
     let mut sandbox = cef::sandbox::Sandbox::new();
     sandbox.initialize(args.as_main_args());
     sandbox
-  };
+  });
 
   #[cfg(target_os = "macos")]
   let _loader = {
