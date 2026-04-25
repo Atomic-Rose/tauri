@@ -828,8 +828,43 @@ fn copy_cef_framework(bundle_directory: &Path, cef_path: &Path) -> crate::Result
       framework_dst.display()
     )
   })?;
+  ensure_cef_sandbox_library(&framework_src, &framework_dst, cef_path)?;
 
   Ok(framework_dst)
+}
+
+fn ensure_cef_sandbox_library(
+  framework_src: &Path,
+  framework_dst: &Path,
+  cef_path: &Path,
+) -> crate::Result<()> {
+  let sandbox_relative_path = Path::new("Libraries/libcef_sandbox.dylib");
+  let sandbox_dst = framework_dst.join(sandbox_relative_path);
+  if sandbox_dst.exists() {
+    return Ok(());
+  }
+
+  let sandbox_src = [
+    framework_src.join(sandbox_relative_path),
+    cef_path.join("libcef_sandbox.dylib"),
+    cef_path.join("Release/libcef_sandbox.dylib"),
+    cef_path.join("Debug/libcef_sandbox.dylib"),
+  ]
+  .into_iter()
+  .find(|path| path.exists());
+
+  if let Some(sandbox_src) = sandbox_src {
+    let sandbox_dst_dir = sandbox_dst
+      .parent()
+      .expect("CEF sandbox library destination has no parent");
+    fs::create_dir_all(sandbox_dst_dir).fs_context(
+      "failed to create CEF sandbox library destination directory",
+      sandbox_dst_dir.to_path_buf(),
+    )?;
+    fs_utils::copy_file(&sandbox_src, &sandbox_dst)?;
+  }
+
+  Ok(())
 }
 
 #[cfg(test)]
