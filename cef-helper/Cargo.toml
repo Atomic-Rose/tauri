@@ -11,8 +11,9 @@ cef = { version = "=146.4.1", default-features = false }
 cef-dll-sys = { version = "=146.4.1", default-features = false }
 
 [features]
-default = ["sandbox"]
-# Mirrors `tauri-runtime-cef` default feature to enable CEF sandbox support on macOS.
+# Mirrors `tauri-runtime-cef`: sandbox is OFF by default until the Helper.app
+# structure and libcef_sandbox.dylib placement are fully in place.
+default = []
 sandbox = ["cef/sandbox"]
 
 # Ensure this crate is NOT treated as part of the repo workspace.

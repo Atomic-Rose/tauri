@@ -2216,10 +2216,6 @@ impl<T: UserEvent> CefRuntime<T> {
       let real_framework = framework_symlink
         .canonicalize()
         .expect("cannot resolve CEF framework symlink inside bundle");
-      let real_frameworks_dir = real_framework
-        .parent()
-        .expect("CEF framework has no parent")
-        .to_path_buf();
       let resources_dir = real_framework.join("Resources");
 
       // Diagnostic: print what NSBundle will see so we can confirm ICU lookup.
@@ -2228,9 +2224,36 @@ impl<T: UserEvent> CefRuntime<T> {
       eprintln!("[cef-debug] CFProcessPath={:?}", std::env::var("CFProcessPath").ok());
       eprintln!("[cef-debug] icudtl accessible={} path={}", icu_path.exists(), icu_path.display());
 
-      settings.browser_subprocess_path = exe.to_string_lossy().as_ref().into();
-      // framework_dir_path: real parent of the .framework (for CEF loading).
-      settings.framework_dir_path = real_frameworks_dir.to_string_lossy().as_ref().into();
+      // browser_subprocess_path: when running from a fully-bundled .app, point
+      // at the cef-helper binary inside Contents/Frameworks/<name> Helper.app/.
+      // CEF on macOS spawns subprocesses (renderer, GPU, plugin, alerts) by
+      // appending " (TYPE)" to this base path. The helper-bundle exe sits at
+      // the depth where LibraryLoader's hardcoded `../../..` walk lands on
+      // Contents/Frameworks/. Pointing at the main exe instead makes that walk
+      // overshoot the bundle and panic with NotFound on the framework binary.
+      // Fall back to the main exe in dev mode (no helper bundles staged yet).
+      let exe_name = exe
+        .file_name()
+        .expect("exe has no file name")
+        .to_string_lossy()
+        .to_string();
+      let helper_exe = bundle_path
+        .join("Contents/Frameworks")
+        .join(format!("{exe_name} Helper.app"))
+        .join("Contents/MacOS")
+        .join(format!("{exe_name} Helper"));
+      let subprocess_path = if helper_exe.is_file() {
+        helper_exe
+      } else {
+        exe.clone()
+      };
+      settings.browser_subprocess_path = subprocess_path.to_string_lossy().as_ref().into();
+      // framework_dir_path: full path to the .framework itself. CEF uses this
+      // for base::apple::SetOverrideFrameworkBundlePath, and ICU init then
+      // calls [FrameworkBundle URLForResource:@"icudtl"] against it. Passing
+      // the parent directory makes [NSBundle bundleWithPath:] return nil and
+      // ICU falls back to the main bundle, where icudtl.dat is not present.
+      settings.framework_dir_path = real_framework.to_string_lossy().as_ref().into();
       // resources_dir_path: where CEF finds *.pak files.
       settings.resources_dir_path = resources_dir.to_string_lossy().as_ref().into();
       // main_bundle_path: set explicitly so CEF uses the fake bundle even if

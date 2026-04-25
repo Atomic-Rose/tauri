@@ -49,7 +49,11 @@ gtk = { version = "0.18", features = ["v3_24"] }
 x11-dl = "2.21"
 
 [features]
-default = ["sandbox"]
+# sandbox is intentionally NOT in defaults: cef::sandbox::Sandbox::new()
+# hard-codes a ../../../ lookup for libcef_sandbox.dylib that requires the
+# Helper.app structure and the sandbox dylib inside the framework. Re-enable
+# once that layout is fully in place.
+default = []
 devtools = []
 macos-private-api = ["tauri-runtime/macos-private-api"]
 sandbox = ["cef/sandbox"]
