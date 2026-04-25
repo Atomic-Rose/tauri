@@ -421,12 +421,14 @@ wrap_app! {
       if let Some(command_line) = command_line {
         for (arg, value) in &self.command_line_args {
           if let Some(value) = value {
+            let arg = arg.trim_start_matches('-');
             command_line.append_switch_with_value(
-              Some(&CefString::from(arg.as_str())),
+              Some(&CefString::from(arg)),
               Some(&CefString::from(value.as_str())),
             );
           } else if arg.starts_with("-") {
-            command_line.append_switch(Some(&CefString::from(arg.as_str())));
+            let arg = arg.trim_start_matches('-');
+            command_line.append_switch(Some(&CefString::from(arg)));
           } else {
             command_line.append_argument(Some(&CefString::from(arg.as_str())));
           }

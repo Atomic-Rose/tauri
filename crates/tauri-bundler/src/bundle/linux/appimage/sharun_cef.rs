@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use std::{fs, path::PathBuf, process::Command};
+use std::{ffi::OsString, fs, path::PathBuf, process::Command};
 
 use anyhow::Context;
 
@@ -13,6 +13,36 @@ use crate::{
 };
 
 use super::write_and_make_executable;
+
+fn prune_library_named_directories(app_dir_path: &std::path::Path) -> crate::Result<()> {
+  let lib_dir = app_dir_path.join("shared/lib");
+  if !lib_dir.exists() {
+    return Ok(());
+  }
+
+  let mut candidates = Vec::new();
+  let mut stack = vec![lib_dir];
+  while let Some(dir) = stack.pop() {
+    for entry in fs::read_dir(&dir)? {
+      let entry = entry?;
+      let path = entry.path();
+      let file_type = entry.file_type()?;
+      if file_type.is_dir() {
+        if entry.file_name().to_string_lossy().contains(".so") {
+          candidates.push(path);
+        } else {
+          stack.push(path);
+        }
+      }
+    }
+  }
+
+  for path in candidates {
+    fs::remove_dir_all(path)?;
+  }
+
+  Ok(())
+}
 
 // TODO: Test if bundling xdg-mime makes sense (eg does it even work if it's not on the host system?)
 // TODO: Monitor TLS support / certificates - seems to be working in initial tests
@@ -171,13 +201,29 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   Command::new("/bin/sh")
     .current_dir(&output_path)
     .env("APPDIR", &app_dir_path)
+    .env("LD_LIBRARY_PATH", {
+      let mut paths = OsString::from(data_dir.join("usr/lib").as_os_str());
+      if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+        paths.push(":");
+        paths.push(existing);
+      }
+      paths
+    })
+    .env(
+      "LIB_DIR",
+      if std::path::Path::new("/usr/lib64").exists() {
+        "/usr/lib64"
+      } else {
+        "/usr/lib"
+      },
+    )
     .env("OUTNAME", &appimage_filename)
     .env(
       "DESKTOP",
       data_dir.join(format!("usr/share/applications/{product_name}.desktop")),
     )
     .env("ICON", &larger_icon.path)
-    .env("OUTPUT_APPIMAGE", "1")
+    .env("OUTPUT_APPIMAGE", "0")
     .env("URUNTIME2APPIMAGE_SOURCE", "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/uruntime2appimage.sh")
     .env("DEPLOY_CHROMIUM", "1")
     .env("ADD_HOOKS", "fix-namespaces.hook")
@@ -196,6 +242,24 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     ])
     .output_ok()
     .context("quick-sharun command failed to run.")?;
+
+  prune_library_named_directories(&app_dir_path)
+    .context("failed to prune invalid library directories from AppDir")?;
+
+  Command::new("/bin/sh")
+    .current_dir(&output_path)
+    .env("APPDIR", &app_dir_path)
+    .env("OUTNAME", &appimage_filename)
+    .env(
+      "DESKTOP",
+      data_dir.join(format!("usr/share/applications/{product_name}.desktop")),
+    )
+    .env("ICON", &larger_icon.path)
+    .env("URUNTIME2APPIMAGE_SOURCE", "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/uruntime2appimage.sh")
+    .arg(&quick_sharun)
+    .arg("--make-appimage")
+    .output_ok()
+    .context("quick-sharun AppImage command failed to run.")?;
 
   {
     use std::os::unix::fs::PermissionsExt;

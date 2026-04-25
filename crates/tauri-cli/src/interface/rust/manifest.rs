@@ -53,6 +53,12 @@ impl Manifest {
       .iter()
       .map(|f| format!("tauri/{f}"))
       .collect();
+    all_enabled_features.extend(
+      self
+        .dependency_features("tauri")
+        .into_iter()
+        .map(|f| format!("tauri/{f}")),
+    );
 
     let manifest_features = self.features();
     for f in enabled_features {
@@ -61,6 +67,47 @@ impl Manifest {
 
     all_enabled_features
   }
+
+  fn dependency_features(&self, dependency_name: &str) -> Vec<String> {
+    self
+      .inner
+      .as_table()
+      .get("dependencies")
+      .and_then(|dependencies| dependencies.as_table_like())
+      .and_then(|dependencies| dependencies.get(dependency_name))
+      .map(dependency_features)
+      .unwrap_or_default()
+  }
+}
+
+fn dependency_features(item: &Item) -> Vec<String> {
+  match item {
+    Item::Table(table) => features_item(table.get("features")),
+    Item::Value(Value::InlineTable(table)) => features_value(table.get("features")),
+    _ => Vec::new(),
+  }
+}
+
+fn features_item(item: Option<&Item>) -> Vec<String> {
+  let Some(Item::Value(value)) = item else {
+    return Vec::new();
+  };
+
+  features_value(Some(value))
+}
+
+fn features_value(value: Option<&Value>) -> Vec<String> {
+  let Some(Value::Array(features)) = value else {
+    return Vec::new();
+  };
+
+  features
+    .iter()
+    .filter_map(|value| match value {
+      Value::String(feature) => Some(feature.value().to_string()),
+      _ => None,
+    })
+    .collect()
 }
 
 fn get_enabled_features(list: &HashMap<String, Vec<String>>, feature: &str) -> Vec<String> {

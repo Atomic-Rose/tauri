@@ -5,7 +5,7 @@
 use std::{
   collections::HashMap,
   ffi::OsStr,
-  fs::FileType,
+  fs::{self, FileType},
   io::{BufRead, Write},
   iter::once,
   path::{Path, PathBuf},
@@ -1420,6 +1420,12 @@ fn resolve_cef_path_for_bundle(
 
   let marker = cef_marker_file(target)?;
   if !resolved.join(marker).exists() {
+    if let Some(build_output_cef_path) =
+      find_cef_path_in_cargo_build_output(workspace_dir, target, marker)
+    {
+      return Ok(build_output_cef_path);
+    }
+
     bail!(
       "CEF binary distribution not found at {} (missing `{marker}`). \
        Run `cargo tauri build` (or `cargo build`) so the build script downloads CEF, \
@@ -1429,6 +1435,41 @@ fn resolve_cef_path_for_bundle(
   }
 
   Ok(resolved)
+}
+
+fn find_cef_path_in_cargo_build_output(
+  workspace_dir: &Path,
+  target: &str,
+  marker: &str,
+) -> Option<PathBuf> {
+  let os_arch = OsAndArch::try_from(target).ok()?.to_string();
+  let mut candidates = Vec::new();
+
+  for profile in ["release", "debug"] {
+    let build_dir = workspace_dir.join("target").join(profile).join("build");
+    let Ok(entries) = fs::read_dir(build_dir) else {
+      continue;
+    };
+
+    for entry in entries.flatten() {
+      let file_name = entry.file_name();
+      if !file_name.to_string_lossy().starts_with("cef-dll-sys-") {
+        continue;
+      }
+
+      let cef_path = entry.path().join("out").join(&os_arch);
+      if cef_path.join(marker).exists() {
+        let modified = entry
+          .metadata()
+          .and_then(|metadata| metadata.modified())
+          .ok();
+        candidates.push((modified, cef_path));
+      }
+    }
+  }
+
+  candidates.sort_by_key(|(modified, _)| *modified);
+  candidates.pop().map(|(_, path)| path)
 }
 
 #[allow(unused_variables, deprecated)]
