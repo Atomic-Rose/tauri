@@ -9,9 +9,10 @@ use dioxus_debug_cell::RefCell;
 use sha2::{Digest, Sha256};
 use std::{
   collections::HashMap,
+  path::PathBuf,
   sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
     mpsc::channel,
   },
 };
@@ -22,17 +23,46 @@ use tauri_runtime::{
     Size,
   },
   webview::{InitializationScript, PendingWebview, UriSchemeProtocolHandler, WebviewAttributes},
-  window::{PendingWindow, WindowEvent, WindowId},
+  window::{DragDropEvent, PendingWindow, WebviewEvent, WindowEvent, WindowId},
 };
 #[cfg(target_os = "macos")]
 use tauri_utils::TitleBarStyle;
 use tauri_utils::html::normalize_script_for_csp;
 
 use crate::{
-  AppWebview, AppWindow, CefRuntime, CefWindowBuilder, DevToolsProtocolHandler, Message,
-  RuntimeStyle as CefRuntimeStyle, WebviewAtribute, WebviewMessage, WindowMessage,
-  cef_webview::CefWebview,
+  AppWebview, AppWindow, CefRuntime, CefWebviewDispatcher, CefWindowBuilder,
+  DevToolsProtocolHandler, Message, RuntimeContext, RuntimeStyle as CefRuntimeStyle,
+  WebviewAtribute, WebviewMessage, WindowMessage, cef_webview::CefWebview,
 };
+
+use std::cell::Cell;
+
+// Tracks whether we're inside a user event callback. When set, `post_message`
+// defers through the CEF task runner instead of executing synchronously, to
+// avoid Win32 message-pump re-entrancy from APIs like ShowWindow/SetFocus
+// or locking a mutex while already locked on the same thread.
+thread_local! {
+  static IN_EVENT_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns true if we're currently inside a user event callback.
+pub fn is_in_event_callback() -> bool {
+  IN_EVENT_CALLBACK.get()
+}
+
+/// Run a function within the context of an event callback, ensuring that [`is_in_event_callback`] returns true for the duration of the callback.
+fn in_callback<R>(f: impl FnOnce() -> R) -> R {
+  struct Guard;
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      IN_EVENT_CALLBACK.set(false);
+    }
+  }
+
+  IN_EVENT_CALLBACK.set(true);
+  let _guard = Guard;
+  f()
+}
 
 mod cookie;
 mod drag_window;
@@ -47,8 +77,120 @@ type CefOsEvent<'a> = *mut u8;
 #[cfg(windows)]
 type CefOsEvent<'a> = Option<&'a mut sys::MSG>;
 type AddressChangedHandler = dyn Fn(&url::Url) + Send + Sync;
+type IpcHandler<T> =
+  dyn Fn(tauri_runtime::webview::DetachedWebview<T, CefRuntime<T>>, http::Request<String>) + Send;
+type PendingInitialLoad = (Browser, String, Arc<Mutex<Vec<url::Url>>>);
+type PendingInitialLoads = Arc<Mutex<HashMap<i32, PendingInitialLoad>>>;
+
+const DRAG_DROP_BRIDGE_PATH: &str = "/__tauri_cef_drag_drop__";
+const IPC_MESSAGE_NAME: &str = "tauri:ipc";
+const IPC_POST_MESSAGE_FUNCTION: &str = "postMessage";
+const ABOUT_BLANK: &str = "about:blank";
+const INITIAL_LOAD_URL: &str = concat!(
+  "data:text/html;charset=utf-8,",
+  "%3C!doctype%20html%3E",
+  "%3Chtml%20data-tauri-cef-internal%3D%22initial-load%22%3E",
+  "%3Chead%3E",
+  "%3Cmeta%20charset%3D%22utf-8%22%3E",
+  "%3Ctitle%3ETauri%20CEF%20Initial%20Load%3C%2Ftitle%3E",
+  "%3C%2Fhead%3E",
+  "%3Cbody%20data-tauri-cef-internal%3D%22initial-load%22%3E",
+  "%3C!--%20Tauri%20CEF%20internal%20initial%20load%20placeholder%20--%3E",
+  "%3C%2Fbody%3E",
+  "%3C%2Fhtml%3E",
+);
+static NEXT_INIT_SCRIPT_DEVTOOLS_MESSAGE_ID: AtomicI32 = AtomicI32::new(1_000_000);
+const DRAG_DROP_INIT_SCRIPT: &str = r#"
+(() => {
+  if (window.__TAURI_CEF_DRAG_DROP__) {
+    return;
+  }
+
+  Object.defineProperty(window, "__TAURI_CEF_DRAG_DROP__", {
+    value: true,
+    configurable: false,
+  });
+
+  const PATH = "/__tauri_cef_drag_drop__";
+  let entered = false;
+
+  const position = (event) => ({
+    x: event.clientX * window.devicePixelRatio,
+    y: event.clientY * window.devicePixelRatio,
+  });
+
+  const send = (type, event) => {
+    const pos = position(event);
+    const url = new URL(PATH, window.location.href);
+    url.searchParams.set("payload", JSON.stringify({ type, x: pos.x, y: pos.y }));
+    fetch(url.href, {
+      method: "GET",
+      cache: "no-store",
+      credentials: "omit",
+    }).catch(() => {});
+  };
+
+  const listen = (eventName, handler) => {
+    window.addEventListener(eventName, handler, { capture: true });
+  };
+
+  listen("dragenter", (event) => {
+    if (!entered) {
+      entered = true;
+      send("enter", event);
+    }
+  });
+
+  listen("dragover", (event) => {
+    if (!entered) {
+      entered = true;
+      send("enter", event);
+    }
+    send("over", event);
+  });
+
+  listen("drop", (event) => {
+    if (!entered) {
+      send("enter", event);
+    }
+    entered = false;
+    send("drop", event);
+  });
+
+  listen("dragleave", (event) => {
+    const x = event.clientX;
+    const y = event.clientY;
+    if (entered && (x <= 0 || y <= 0 || x >= window.innerWidth || y >= window.innerHeight)) {
+      entered = false;
+      send("leave", event);
+    }
+  });
+})();
+"#;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragDropEventTarget {
+  Window,
+  Webview,
+}
+
+#[derive(Default)]
+struct DragDropState {
+  paths: Option<Vec<PathBuf>>,
+  native_entered: bool,
+  entered: bool,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct DragDropScriptEvent {
+  #[serde(rename = "type")]
+  kind: String,
+  x: f64,
+  y: f64,
+}
 
 /// CEF transparent color value (ARGB)
+#[allow(dead_code)]
 const TRANSPARENT: u32 = 0x00000000;
 
 #[inline]
@@ -94,6 +236,14 @@ fn rect_to_cef(rect: Rect, scale_factor: f64) -> cef::Rect {
     width: s.width,
     height: s.height,
   }
+}
+
+#[inline]
+fn window_scale_factor(window: &Window) -> f64 {
+  window
+    .display()
+    .map(|d| d.device_scale_factor() as f64)
+    .unwrap_or(1.0)
 }
 
 #[inline]
@@ -353,6 +503,49 @@ fn hash_script(script: &str) -> String {
   )
 }
 
+fn initialization_scripts_from_webview_attributes(
+  webview_attributes: &mut WebviewAttributes,
+) -> Arc<Vec<CefInitScript>> {
+  let mut initialization_scripts = Vec::new();
+
+  if webview_attributes.drag_drop_handler_enabled {
+    initialization_scripts.push(CefInitScript::new(InitializationScript {
+      script: DRAG_DROP_INIT_SCRIPT.to_string(),
+      for_main_frame_only: false,
+    }));
+  }
+
+  initialization_scripts.extend(
+    std::mem::take(&mut webview_attributes.initialization_scripts)
+      .into_iter()
+      .map(CefInitScript::new),
+  );
+
+  Arc::new(initialization_scripts)
+}
+
+fn collect_drag_data_paths(drag_data: &mut DragData) -> Vec<PathBuf> {
+  let mut paths = CefStringList::new();
+  if drag_data.file_paths(Some(&mut paths)) != 0 {
+    let paths = paths
+      .into_iter()
+      .filter(|path| !path.is_empty())
+      .map(PathBuf::from)
+      .collect::<Vec<_>>();
+
+    if !paths.is_empty() {
+      return paths;
+    }
+  }
+
+  let file_name = CefStringUtf16::from(&drag_data.file_name()).to_string();
+  if file_name.is_empty() {
+    Vec::new()
+  } else {
+    vec![PathBuf::from(file_name)]
+  }
+}
+
 pub type SchemeHandlerRegistry = Arc<
   Mutex<
     HashMap<
@@ -397,6 +590,14 @@ impl<T: UserEvent> Context<T> {
   }
 }
 
+fn runtime_context<T: UserEvent>(context: &Context<T>) -> RuntimeContext<T> {
+  RuntimeContext {
+    main_thread_task_runner: cef::task_runner_get_for_current_thread().expect("null task runner"),
+    main_thread_id: std::thread::current().id(),
+    cef_context: context.clone(),
+  }
+}
+
 wrap_app! {
   pub struct TauriApp<T: UserEvent> {
     context: Context<T>,
@@ -411,6 +612,10 @@ wrap_app! {
         self.context.clone(),
         self.deep_link_schemes.clone(),
       ))
+    }
+
+    fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+      Some(TauriRenderProcessHandler::new())
     }
 
     fn on_before_command_line_processing(
@@ -460,28 +665,138 @@ wrap_browser_process_handler! {
       let mut list = CefStringList::new();
       command_line.arguments(Some(&mut list));
       let args: Vec<String> = list.into_iter().collect();
-      if args.len() == 1
-        && let Ok(url) = url::Url::parse(&args[0]) {
-          let scheme = url.scheme().to_string();
-          if self.deep_link_schemes.iter().any(|s| s == &scheme) {
-            (self.context.callback.borrow())(RunEvent::Opened {
-              urls: vec![url],
-            });
-            return 1;
-          }
+      if let Ok(url) = url::Url::parse(&args[0]) {
+        let scheme = url.scheme().to_string();
+        if self.deep_link_schemes.iter().any(|s| s == &scheme) {
+          (self.context.callback.borrow())(RunEvent::Opened {
+            urls: vec![url],
+          });
+          return 1;
         }
+      }
       // TODO: add event
       1
     }
   }
 }
 
+wrap_v8_handler! {
+  struct IpcPostMessageV8Handler;
+
+  impl V8Handler {
+    fn execute(
+      &self,
+      name: Option<&CefString>,
+      _object: Option<&mut V8Value>,
+      arguments: Option<&[Option<V8Value>]>,
+      retval: Option<&mut Option<V8Value>>,
+      exception: Option<&mut CefString>,
+    ) -> std::os::raw::c_int {
+      let Some(name) = name else {
+        return 0;
+      };
+      if name.to_string() != IPC_POST_MESSAGE_FUNCTION {
+        return 0;
+      }
+
+      let Some(message) = arguments
+        .filter(|arguments| arguments.len() == 1)
+        .and_then(|arguments| arguments[0].as_ref())
+        .filter(|argument| argument.is_string() != 0)
+      else {
+        if let Some(exception) = exception {
+          *exception = CefString::from("window.ipc.postMessage expects a string argument");
+        }
+        return 1;
+      };
+
+      let Some(context) = v8_context_get_current_context() else {
+        return 1;
+      };
+      let Some(frame) = context.frame() else {
+        return 1;
+      };
+
+      let body = CefString::from(&message.string_value()).to_string();
+      let url = CefString::from(&frame.url()).to_string();
+      let mut process_message = process_message_create(Some(&CefString::from(IPC_MESSAGE_NAME)));
+      if let Some(args) = process_message.as_ref().and_then(ProcessMessage::argument_list) {
+        args.set_string(0, Some(&CefString::from(url.as_str())));
+        args.set_string(1, Some(&CefString::from(body.as_str())));
+        frame.send_process_message(ProcessId::BROWSER, process_message.as_mut());
+      }
+
+      if let Some(retval) = retval {
+        *retval = v8_value_create_undefined();
+      }
+      1
+    }
+  }
+}
+
+fn install_ipc_post_message(context: Option<&mut V8Context>) {
+  let Some(window) = context.and_then(|context| context.global()) else {
+    return;
+  };
+
+  let attributes = sys::cef_v8_propertyattribute_t(
+    [
+      sys::cef_v8_propertyattribute_t::V8_PROPERTY_ATTRIBUTE_READONLY,
+      sys::cef_v8_propertyattribute_t::V8_PROPERTY_ATTRIBUTE_DONTENUM,
+      sys::cef_v8_propertyattribute_t::V8_PROPERTY_ATTRIBUTE_DONTDELETE,
+    ]
+    .into_iter()
+    .fold(0, |acc, attr| acc | attr.0),
+  )
+  .into();
+
+  let Some(mut ipc) = v8_value_create_object(None, None) else {
+    return;
+  };
+  let mut handler = IpcPostMessageV8Handler::new();
+  let post_message_name = CefString::from(IPC_POST_MESSAGE_FUNCTION);
+  let Some(mut post_message) =
+    v8_value_create_function(Some(&post_message_name), Some(&mut handler))
+  else {
+    return;
+  };
+
+  ipc.set_value_bykey(
+    Some(&post_message_name),
+    Some(&mut post_message),
+    attributes,
+  );
+  window.set_value_bykey(Some(&CefString::from("ipc")), Some(&mut ipc), attributes);
+}
+
+wrap_render_process_handler! {
+  struct TauriRenderProcessHandler;
+
+  impl RenderProcessHandler {
+    fn on_context_created(
+      &self,
+      _browser: Option<&mut Browser>,
+      _frame: Option<&mut Frame>,
+      context: Option<&mut V8Context>,
+    ) {
+      install_ipc_post_message(context);
+    }
+  }
+}
+
+wrap_app! {
+  pub struct TauriRenderApp;
+
+  impl App {
+    fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+      Some(TauriRenderProcessHandler::new())
+    }
+  }
+}
+
 wrap_load_handler! {
   struct BrowserLoadHandler {
-    initialization_scripts: Arc<Vec<CefInitScript>>,
     on_page_load_handler: Option<Arc<tauri_runtime::webview::OnPageLoadHandler>>,
-    custom_scheme_domain_names: Vec<String>,
-    custom_protocol_scheme: String,
   }
 
   impl LoadHandler {
@@ -510,7 +825,7 @@ wrap_load_handler! {
       &self,
       _browser: Option<&mut Browser>,
       frame: Option<&mut Frame>,
-      http_status_code: ::std::os::raw::c_int,
+      _http_status_code: ::std::os::raw::c_int,
     ) {
       let Some(frame) = frame else { return };
 
@@ -522,53 +837,32 @@ wrap_load_handler! {
             handler(url, tauri_runtime::webview::PageLoadEvent::Finished);
           }
         }
+    }
+  }
+}
 
-      // run init scripts for http/https pages that are not custom schemes
-      // custom schemes are handled by the request handler
-      // where we inject scripts directly in the html
+wrap_drag_handler! {
+  struct BrowserDragHandler {
+    drag_drop_state: Arc<Mutex<DragDropState>>,
+  }
 
-      if !(200..300).contains(&http_status_code) {
-        return;
-      }
+  impl DragHandler {
+    fn on_drag_enter(
+      &self,
+      _browser: Option<&mut Browser>,
+      drag_data: Option<&mut DragData>,
+      _mask: DragOperationsMask,
+    ) -> ::std::os::raw::c_int {
+      let mut state = self.drag_drop_state.lock().unwrap();
+      state.entered = false;
+      state.paths = drag_data
+        .map(collect_drag_data_paths)
+        .filter(|paths| !paths.is_empty());
+      state.native_entered = state.paths.is_some();
 
-      let url = frame.url();
-      let url_str = cef::CefString::from(&url).to_string();
-      let url_obj = url::Url::parse(&url_str).ok();
-
-      let is_custom_scheme_url = url_obj
-        .as_ref()
-        .map(|u| {
-          let scheme = u.scheme();
-          if scheme == self.custom_protocol_scheme {
-            let host_str = u.host_str().unwrap_or("").to_string();
-            scheme == self.custom_protocol_scheme && self.custom_scheme_domain_names.contains(&host_str)
-          } else {
-            false
-          }
-        });
-      // if we can't parse the URL, also return
-      if is_custom_scheme_url.unwrap_or(true) { return; }
-
-      let is_main_frame = frame.is_main() == 1;
-
-      let scripts_to_execute = if is_main_frame {
-       Box::new(self.initialization_scripts.iter().map(|s| &s.script.script)) as Box<dyn std::iter::Iterator<Item = &String>>
-      } else {
-        Box::new(self.initialization_scripts
-          .iter()
-          .filter(|s| !s.script.for_main_frame_only)
-          .map(|s| &s.script.script)) as Box<dyn std::iter::Iterator<Item = &String>>
-      };
-
-      for script in scripts_to_execute {
-        let script_url = format!("{}://__tauri_init_script__", url_obj.as_ref().map(|u| u.scheme()).unwrap_or("http"));
-
-        frame.execute_java_script(
-          Some(&cef::CefString::from(script.as_str())),
-          Some(&cef::CefString::from(script_url.as_str())),
-          0,
-        );
-      }
+      // Let Chromium continue with the drag operation so the injected script can
+      // report over/drop/leave with accurate viewport positions.
+      0
     }
   }
 }
@@ -577,6 +871,7 @@ wrap_display_handler! {
   struct BrowserDisplayHandler {
     document_title_changed_handler: Option<Arc<tauri_runtime::webview::DocumentTitleChangedHandler>>,
     address_changed_handler: Option<Arc<AddressChangedHandler>>,
+    suppressed_navigations: Arc<Mutex<Vec<url::Url>>>,
   }
 
   impl DisplayHandler {
@@ -606,6 +901,13 @@ wrap_display_handler! {
       let Some(url) = url else { return };
       let url_str = url.to_string();
       let Ok(parsed) = url::Url::parse(&url_str) else { return };
+      {
+        let mut suppressed_navigations = self.suppressed_navigations.lock().unwrap();
+        if let Some(index) = suppressed_navigations.iter().position(|suppressed| suppressed == &parsed) {
+          suppressed_navigations.remove(index);
+          return;
+        }
+      }
       handler(&parsed);
     }
   }
@@ -635,6 +937,7 @@ wrap_context_menu_handler! {
 cef::wrap_dev_tools_message_observer! {
   struct TauriDevToolsProtocolObserver {
     handlers: Arc<Mutex<Vec<Arc<DevToolsProtocolHandler>>>>,
+    pending_initial_loads: PendingInitialLoads,
   }
 
   impl DevToolsMessageObserver {
@@ -661,6 +964,12 @@ cef::wrap_dev_tools_message_observer! {
       success: std::os::raw::c_int,
       result: Option<&[u8]>,
     ) {
+      if let Some((browser, initial_url, suppressed_navigations)) =
+        self.pending_initial_loads.lock().unwrap().remove(&message_id)
+      {
+        post_load_initial_url(browser, initial_url, suppressed_navigations);
+      }
+
       let protocol = crate::DevToolsProtocol::MethodResult {
         message_id,
         success: success != 0,
@@ -694,17 +1003,265 @@ cef::wrap_dev_tools_message_observer! {
   }
 }
 
+fn runtime_evaluate_result_to_json(result: Option<&[u8]>) -> String {
+  let Some(result) = result else {
+    return String::new();
+  };
+  let Ok(result) = serde_json::from_slice::<serde_json::Value>(result) else {
+    return String::new();
+  };
+
+  if result.get("exceptionDetails").is_some() {
+    return String::new();
+  }
+
+  let remote_object = result.get("result").unwrap_or(&result);
+  remote_object
+    .get("value")
+    .and_then(|value| serde_json::to_string(value).ok())
+    .unwrap_or_default()
+}
+
+cef::wrap_dev_tools_message_observer! {
+  struct EvalScriptWithCallbackDevToolsObserver {
+    message_id: Arc<AtomicI32>,
+    callback: Arc<Mutex<Option<Box<dyn Fn(String) + Send + 'static>>>>,
+    registration: Arc<Mutex<Option<cef::Registration>>>,
+  }
+
+  impl DevToolsMessageObserver {
+    fn on_dev_tools_method_result(
+      &self,
+      _browser: Option<&mut Browser>,
+      message_id: std::os::raw::c_int,
+      success: std::os::raw::c_int,
+      result: Option<&[u8]>,
+    ) {
+      if message_id != self.message_id.load(Ordering::Relaxed) {
+        return;
+      }
+
+      let Some(callback) = self.callback.lock().unwrap().take() else {
+        return;
+      };
+
+      let result = if success != 0 {
+        runtime_evaluate_result_to_json(result)
+      } else {
+        String::new()
+      };
+      callback(result);
+
+      let _ = self.registration.lock().unwrap().take();
+    }
+  }
+}
+
 /// Registers a DevTools protocol observer. Returns the [`cef::Registration`] which must be
 /// kept alive for the observer to stay registered. The observer is unregistered when
 /// the Registration is dropped.
 fn add_dev_tools_observer(
   browser: &cef::Browser,
   handlers: Arc<Mutex<Vec<Arc<DevToolsProtocolHandler>>>>,
+  pending_initial_loads: PendingInitialLoads,
 ) -> Option<cef::Registration> {
   browser.host().and_then(|host| {
-    let mut observer = TauriDevToolsProtocolObserver::new(handlers);
+    let mut observer = TauriDevToolsProtocolObserver::new(handlers, pending_initial_loads);
     host.add_dev_tools_message_observer(Some(&mut observer))
   })
+}
+
+fn devtools_initialization_script_source(
+  initialization_scripts: &[CefInitScript],
+  custom_protocol_scheme: &str,
+  custom_scheme_domain_names: &[String],
+) -> Option<String> {
+  if initialization_scripts.is_empty() {
+    return None;
+  }
+
+  let custom_protocol = serde_json::to_string(&format!("{custom_protocol_scheme}:")).ok()?;
+  let custom_domains = serde_json::to_string(custom_scheme_domain_names).ok()?;
+  let mut source = format!(
+    r#"{{
+  const __TAURI_CEF_INIT_CUSTOM_PROTOCOL__ = {custom_protocol};
+  const __TAURI_CEF_INIT_CUSTOM_DOMAINS__ = new Set({custom_domains});
+  const __TAURI_CEF_INIT_IS_CUSTOM_PROTOCOL__ =
+    location.protocol === __TAURI_CEF_INIT_CUSTOM_PROTOCOL__
+    && __TAURI_CEF_INIT_CUSTOM_DOMAINS__.has(location.hostname);
+  const __TAURI_CEF_INIT_IS_MAIN_FRAME__ = (() => {{
+    try {{
+      return window.top === window;
+    }} catch (_) {{
+      return false;
+    }}
+  }})();
+"#
+  );
+
+  for init_script in initialization_scripts {
+    source.push_str("  if (!__TAURI_CEF_INIT_IS_CUSTOM_PROTOCOL__");
+    if init_script.script.for_main_frame_only {
+      source.push_str(" && __TAURI_CEF_INIT_IS_MAIN_FRAME__");
+    }
+    source.push_str(") {\n");
+    source.push_str(init_script.script.script.as_str());
+    source.push_str("\n  }\n");
+  }
+
+  source.push_str("}\n");
+  Some(source)
+}
+
+fn register_initialization_scripts(
+  browser: &Browser,
+  initialization_scripts: &[CefInitScript],
+  custom_protocol_scheme: &str,
+  custom_scheme_domain_names: &[String],
+  initial_url: String,
+  suppressed_navigations: Arc<Mutex<Vec<url::Url>>>,
+  pending_initial_loads: &PendingInitialLoads,
+) -> bool {
+  let Some(source) = devtools_initialization_script_source(
+    initialization_scripts,
+    custom_protocol_scheme,
+    custom_scheme_domain_names,
+  ) else {
+    return false;
+  };
+  let Some(host) = browser.host() else {
+    return false;
+  };
+
+  let page_enable_message_id = NEXT_INIT_SCRIPT_DEVTOOLS_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
+  let page_enable_message = serde_json::json!({
+    "id": page_enable_message_id,
+    "method": "Page.enable",
+    "params": {}
+  })
+  .to_string();
+  let _ = host.send_dev_tools_message(Some(page_enable_message.as_bytes()));
+
+  let message_id = NEXT_INIT_SCRIPT_DEVTOOLS_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
+  let message = serde_json::json!({
+    "id": message_id,
+    "method": "Page.addScriptToEvaluateOnNewDocument",
+    "params": {
+      "source": source,
+    }
+  })
+  .to_string();
+
+  pending_initial_loads.lock().unwrap().insert(
+    message_id,
+    (browser.clone(), initial_url, suppressed_navigations),
+  );
+  if host.send_dev_tools_message(Some(message.as_bytes())) == 1 {
+    true
+  } else {
+    pending_initial_loads.lock().unwrap().remove(&message_id);
+    false
+  }
+}
+
+wrap_task! {
+  struct LoadInitialUrlTask {
+    browser: Browser,
+    initial_url: String,
+    suppressed_navigations: Arc<Mutex<Vec<url::Url>>>,
+  }
+
+  impl Task {
+    fn execute(&self) {
+      load_initial_url(&self.browser, &self.initial_url, &self.suppressed_navigations);
+    }
+  }
+}
+
+fn post_load_initial_url(
+  browser: Browser,
+  initial_url: String,
+  suppressed_navigations: Arc<Mutex<Vec<url::Url>>>,
+) {
+  let mut task = LoadInitialUrlTask::new(browser, initial_url, suppressed_navigations);
+  cef::post_task(sys::cef_thread_id_t::TID_UI.into(), Some(&mut task));
+}
+
+// Browsers are created with an inert internal document so the BrowserHost exists
+// before the app's real first navigation starts. That gives us a chance to
+// register the CDP document-start script for remote/cross-site navigations; the
+// custom-protocol path still injects into HTML because CEF does not apply this
+// CDP hook to those documents reliably.
+//
+// The real load is posted as a CEF UI task instead of performed inline. This
+// keeps the browser creation/CDP setup stack from re-entering navigation and
+// also lets the one-shot navigation/address suppression observe the internal
+// placeholder before the app URL is loaded.
+fn load_initial_url_after_registering_initialization_scripts(
+  browser: &Browser,
+  initialization_scripts: &[CefInitScript],
+  custom_protocol_scheme: &str,
+  custom_scheme_domain_names: &[String],
+  initial_url: &str,
+  suppressed_navigations: &Arc<Mutex<Vec<url::Url>>>,
+  pending_initial_loads: &PendingInitialLoads,
+) {
+  let browser_for_callback = browser.clone();
+  let initial_url = initial_url.to_string();
+  let suppressed_navigations = suppressed_navigations.clone();
+  let is_waiting_for_initialization_scripts = register_initialization_scripts(
+    browser,
+    initialization_scripts,
+    custom_protocol_scheme,
+    custom_scheme_domain_names,
+    initial_url.clone(),
+    suppressed_navigations.clone(),
+    pending_initial_loads,
+  );
+
+  if !is_waiting_for_initialization_scripts {
+    post_load_initial_url(browser_for_callback, initial_url, suppressed_navigations);
+  }
+}
+
+fn clear_suppressed_initial_load_urls(suppressed_navigations: &Arc<Mutex<Vec<url::Url>>>) {
+  let initial_urls = [INITIAL_LOAD_URL, ABOUT_BLANK]
+    .into_iter()
+    .filter_map(|url| url::Url::parse(url).ok())
+    .collect::<Vec<_>>();
+  if !initial_urls.is_empty() {
+    suppressed_navigations
+      .lock()
+      .unwrap()
+      .retain(|url| !initial_urls.iter().any(|initial_url| initial_url == url));
+  }
+}
+
+fn suppress_navigation(initial_url: &str, suppressed_navigations: &Arc<Mutex<Vec<url::Url>>>) {
+  let Ok(url) = url::Url::parse(initial_url) else {
+    return;
+  };
+
+  let mut suppressed_navigations = suppressed_navigations.lock().unwrap();
+  if !suppressed_navigations
+    .iter()
+    .any(|suppressed| suppressed == &url)
+  {
+    suppressed_navigations.push(url);
+  }
+}
+
+fn load_initial_url(
+  browser: &Browser,
+  initial_url: &str,
+  suppressed_navigations: &Arc<Mutex<Vec<url::Url>>>,
+) {
+  clear_suppressed_initial_load_urls(suppressed_navigations);
+  suppress_navigation(initial_url, suppressed_navigations);
+
+  if let Some(frame) = browser.main_frame() {
+    frame.load_url(Some(&CefString::from(initial_url)));
+  }
 }
 
 wrap_keyboard_handler! {
@@ -1084,25 +1641,42 @@ wrap_client! {
   struct BrowserClient<T: UserEvent> {
     window_kind: WindowKind,
     window_id: WindowId,
-    initialization_scripts: Arc<Vec<CefInitScript>>,
+    webview_id: u32,
+    label: String,
+    drag_drop_event_target: DragDropEventTarget,
+    drag_drop_handler_enabled: bool,
+    drag_drop_state: Arc<Mutex<DragDropState>>,
+    ipc_handler: Option<Arc<IpcHandler<T>>>,
     on_page_load_handler: Option<Arc<tauri_runtime::webview::OnPageLoadHandler>>,
     document_title_changed_handler: Option<Arc<tauri_runtime::webview::DocumentTitleChangedHandler>>,
     navigation_handler: Option<Arc<tauri_runtime::webview::NavigationHandler>>,
+    suppressed_navigations: Arc<Mutex<Vec<url::Url>>>,
     address_changed_handler: Option<Arc<AddressChangedHandler>>,
     new_window_handler: Option<Arc<tauri_runtime::webview::NewWindowHandler<T, crate::CefRuntime<T>>>>,
     download_handler: Option<Arc<tauri_runtime::webview::DownloadHandler>>,
     devtools_enabled: bool,
-    custom_scheme_domain_names: Vec<String>,
-    custom_protocol_scheme: String,
     context: Context<T>,
+    runtime_context: RuntimeContext<T>,
     initial_url: Option<String>,
   }
 
   impl Client {
+    fn drag_handler(&self) -> Option<DragHandler> {
+      self
+        .drag_drop_handler_enabled
+        .then(|| BrowserDragHandler::new(self.drag_drop_state.clone()))
+    }
+
     fn request_handler(&self) -> Option<RequestHandler> {
       Some(request_handler::WebRequestHandler::new(
-        self.initialization_scripts.clone(),
         self.navigation_handler.clone(),
+        self.suppressed_navigations.clone(),
+        self.context.clone(),
+        self.window_id,
+        self.webview_id,
+        self.drag_drop_event_target,
+        self.drag_drop_handler_enabled,
+        self.drag_drop_state.clone(),
       ))
     }
 
@@ -1117,18 +1691,14 @@ wrap_client! {
     }
 
     fn load_handler(&self) -> Option<LoadHandler> {
-      Some(BrowserLoadHandler::new(
-        self.initialization_scripts.clone(),
-        self.on_page_load_handler.clone(),
-        self.custom_scheme_domain_names.clone(),
-        self.custom_protocol_scheme.clone(),
-      ))
+      Some(BrowserLoadHandler::new(self.on_page_load_handler.clone()))
     }
 
     fn display_handler(&self) -> Option<DisplayHandler> {
       Some(BrowserDisplayHandler::new(
         self.document_title_changed_handler.clone(),
         self.address_changed_handler.clone(),
+        self.suppressed_navigations.clone(),
       ))
     }
 
@@ -1147,6 +1717,55 @@ wrap_client! {
     fn permission_handler(&self) -> Option<PermissionHandler> {
       Some(BrowserPermissionHandler::new())
     }
+
+    fn on_process_message_received(
+      &self,
+      _browser: Option<&mut Browser>,
+      frame: Option<&mut Frame>,
+      source_process: ProcessId,
+      message: Option<&mut ProcessMessage>,
+    ) -> std::os::raw::c_int {
+      if source_process != ProcessId::RENDERER {
+        return 0;
+      }
+
+      let Some(message) = message else {
+        return 0;
+      };
+      if CefString::from(&message.name()).to_string() != IPC_MESSAGE_NAME {
+        return 0;
+      }
+
+      let Some(handler) = &self.ipc_handler else {
+        return 1;
+      };
+      let Some(args) = message.argument_list() else {
+        return 1;
+      };
+
+      let mut url = CefString::from(&args.string(0)).to_string();
+      if url.is_empty()
+        && let Some(frame) = frame {
+          url = CefString::from(&frame.url()).to_string();
+        }
+      let body = CefString::from(&args.string(1)).to_string();
+
+      if let Ok(request) = http::Request::builder().uri(url).body(body) {
+        handler(
+          tauri_runtime::webview::DetachedWebview {
+            label: self.label.clone(),
+            dispatcher: CefWebviewDispatcher {
+              window_id: Arc::new(Mutex::new(self.window_id)),
+              webview_id: self.webview_id,
+              context: self.runtime_context.clone(),
+            },
+          },
+          request,
+        );
+      }
+
+      1
+    }
   }
 }
 
@@ -1158,6 +1777,11 @@ wrap_browser_view_delegate! {
     webview_label: String,
     uri_scheme_protocols: Arc<HashMap<String, Arc<Box<tauri_runtime::webview::UriSchemeProtocolHandler>>>>,
     initialization_scripts: Arc<Vec<CefInitScript>>,
+    custom_protocol_scheme: String,
+    custom_scheme_domain_names: Vec<String>,
+    initial_url: String,
+    suppressed_navigations: Arc<Mutex<Vec<url::Url>>>,
+    pending_initial_loads: PendingInitialLoads,
     devtools_protocol_handlers: Arc<Mutex<Vec<Arc<DevToolsProtocolHandler>>>>,
     devtools_observer_registration: Arc<Mutex<Option<cef::Registration>>>,
     webview_attributes: Arc<RefCell<WebviewAttributes>>,
@@ -1187,12 +1811,6 @@ wrap_browser_view_delegate! {
         let real_id = browser.identifier();
         let _ = std::mem::replace(&mut *self.browser_id.borrow_mut(), real_id);
 
-        // Only add the observer when at least one listener is registered
-        if !self.devtools_protocol_handlers.lock().unwrap().is_empty()
-          && let Some(registration) = add_dev_tools_observer(browser, self.devtools_protocol_handlers.clone()) {
-            self.devtools_observer_registration.lock().unwrap().replace(registration);
-          }
-
         let mut registry = self.scheme_handler_registry.lock().unwrap();
         for (scheme, handler) in self.uri_scheme_protocols.iter() {
           registry.insert(
@@ -1204,6 +1822,28 @@ wrap_browser_view_delegate! {
             ),
           );
         }
+        drop(registry);
+
+        {
+          let mut devtools_observer_registration = self.devtools_observer_registration.lock().unwrap();
+          if devtools_observer_registration.is_none()
+            && let Some(registration) =
+              add_dev_tools_observer(browser, self.devtools_protocol_handlers.clone(), self.pending_initial_loads.clone())
+          {
+            devtools_observer_registration.replace(registration);
+          }
+        }
+
+        load_initial_url_after_registering_initialization_scripts(
+          browser,
+          &self.initialization_scripts,
+          &self.custom_protocol_scheme,
+          &self.custom_scheme_domain_names,
+          &self.initial_url,
+          &self.suppressed_navigations,
+          &self.pending_initial_loads,
+        );
+
       }
     }
 
@@ -1227,6 +1867,7 @@ wrap_window_delegate! {
     attributes: Arc<RefCell<crate::CefWindowBuilder>>,
     last_emitted_position: RefCell<PhysicalPosition<i32>>,
     last_emitted_size: RefCell<PhysicalSize<u32>>,
+    last_emitted_scale_factor: RefCell<f64>,
     suppress_next_theme_changed: RefCell<bool>,
     context: Context<T>
   }
@@ -1305,16 +1946,17 @@ wrap_window_delegate! {
     }
 
     fn on_theme_changed(&self, view: Option<&mut View>) {
-      let Some(view) = view else { return; };
-
       let attrs = self.attributes.borrow();
 
       #[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]
-      if attrs.transparent.unwrap_or_default() {
-        view.set_background_color(TRANSPARENT);
-      } else if let Some(color) = attrs.background_color {
-        let color = color_to_cef_argb(color);
-        view.set_background_color(color);
+      {
+        let Some(view) = view else { return; };
+          if attrs.transparent.unwrap_or_default() {
+          view.set_background_color(TRANSPARENT);
+        } else if let Some(color) = attrs.background_color {
+          let color = color_to_cef_argb(color);
+          view.set_background_color(color);
+        }
       }
 
       // macOS resets traffic light button positions during the layout pass
@@ -1380,6 +2022,8 @@ wrap_window_delegate! {
   impl WindowDelegate {
     fn on_window_created(&self, window: Option<&mut Window>) {
       if let Some(window) = window {
+        *self.last_emitted_scale_factor.borrow_mut() = window_scale_factor(window);
+
         // Setup necessary handling for `start_window_dragging` to work on Windows
         #[cfg(windows)]
         drag_window::windows::subclass_window_for_dragging(window);
@@ -1629,10 +2273,33 @@ wrap_window_delegate! {
         inner.set_bounds(Some(&rect));
       }
 
-      let scale = window
-          .display()
-          .map(|d| d.device_scale_factor() as f64)
-          .unwrap_or(1.0);
+      let scale = window_scale_factor(window);
+
+      #[cfg(not(windows))]
+      let physical_size = size.to_physical::<u32>(scale);
+
+      #[cfg(windows)]
+      let physical_size = size;
+
+      let scale_factor_changed = {
+        let mut emitted_scale_factor = self.last_emitted_scale_factor.borrow_mut();
+        let changed = *emitted_scale_factor != scale;
+        if changed {
+          *emitted_scale_factor = scale;
+        }
+        changed
+      };
+      if scale_factor_changed {
+        send_window_event(
+          self.window_id,
+          &self.windows,
+          &self.callback,
+          WindowEvent::ScaleFactorChanged {
+            scale_factor: scale,
+            new_inner_size: physical_size,
+          },
+        );
+      }
 
       let physical_position = LogicalPosition::new(bounds.x, bounds.y)
         .to_physical::<i32>(scale);
@@ -1653,10 +2320,6 @@ wrap_window_delegate! {
         );
       }
 
-      let physical_size = LogicalSize::new(
-        bounds.width as u32,
-        bounds.height as u32,
-      ).to_physical::<u32>(scale);
       let size_changed = {
         let mut emitted_size = self.last_emitted_size.borrow_mut();
         let changed = *emitted_size != physical_size;
@@ -1750,6 +2413,44 @@ fn handle_webview_message<T: UserEvent>(
           Some(&cef::CefString::from("")),
           0,
         );
+      }
+    }
+    WebviewMessage::EvaluateScriptWithCallback(script, callback) => {
+      if let Some(host) = get_browser(context, window_id, webview_id).and_then(|b| b.host()) {
+        let message_id = context.next_webview_event_id() as i32 + 1;
+        let message_id = Arc::new(AtomicI32::new(message_id));
+        let callback = Arc::new(Mutex::new(Some(callback)));
+        let registration = Arc::new(Mutex::new(None));
+        let mut observer = EvalScriptWithCallbackDevToolsObserver::new(
+          message_id.clone(),
+          callback.clone(),
+          registration.clone(),
+        );
+
+        if let Some(observer_registration) =
+          host.add_dev_tools_message_observer(Some(&mut observer))
+        {
+          *registration.lock().unwrap() = Some(observer_registration);
+
+          let message = serde_json::json!({
+            "id": message_id.load(Ordering::Relaxed),
+            "method": "Runtime.evaluate",
+            "params": {
+              "expression": script,
+              "returnByValue": true,
+            }
+          })
+          .to_string();
+
+          if host.send_dev_tools_message(Some(message.as_bytes())) != 1 {
+            let _ = registration.lock().unwrap().take();
+            if let Some(callback) = callback.lock().unwrap().take() {
+              callback(String::new());
+            }
+          }
+        } else if let Some(callback) = callback.lock().unwrap().take() {
+          callback(String::new());
+        }
       }
     }
     WebviewMessage::Navigate(url) => {
@@ -2205,13 +2906,24 @@ fn handle_webview_message<T: UserEvent>(
     WebviewMessage::OnDevToolsProtocol(handler, tx) => {
       let result = match get_webview(context, window_id, webview_id) {
         Some(webview) => {
-          let mut handlers = webview.devtools_protocol_handlers.lock().unwrap();
-          handlers.push(handler);
-          // Add the observer when the first listener is registered
-          if handlers.len() == 1
+          webview
+            .devtools_protocol_handlers
+            .lock()
+            .unwrap()
+            .push(handler);
+
+          let needs_devtools_observer = webview
+            .devtools_observer_registration
+            .lock()
+            .unwrap()
+            .is_none();
+          if needs_devtools_observer
             && let Some(browser) = get_browser(context, window_id, webview_id)
-            && let Some(registration) =
-              add_dev_tools_observer(&browser, webview.devtools_protocol_handlers.clone())
+            && let Some(registration) = add_dev_tools_observer(
+              &browser,
+              webview.devtools_protocol_handlers.clone(),
+              Arc::new(Mutex::new(HashMap::new())),
+            )
           {
             *webview.devtools_observer_registration.lock().unwrap() = Some(registration);
           }
@@ -3227,21 +3939,23 @@ pub fn handle_message<T: UserEvent>(context: &Context<T>, message: Message<T>) {
     } => handle_webview_message(context, window_id, webview_id, message),
     Message::RequestExit(code) => {
       let (tx, rx) = channel();
-      (context.callback.borrow())(RunEvent::ExitRequested {
-        code: Some(code),
-        tx,
+      in_callback(|| {
+        (context.callback.borrow())(RunEvent::ExitRequested {
+          code: Some(code),
+          tx,
+        });
       });
 
       let recv = rx.try_recv();
       let should_prevent = matches!(recv, Ok(ExitRequestedEventAction::Prevent));
 
       if !should_prevent {
-        (context.callback.borrow())(RunEvent::Exit);
+        in_callback(|| (context.callback.borrow())(RunEvent::Exit));
       }
     }
     Message::Task(t) => t(),
     Message::UserEvent(evt) => {
-      (context.callback.borrow())(RunEvent::UserEvent(evt));
+      in_callback(|| (context.callback.borrow())(RunEvent::UserEvent(evt)));
     }
     Message::Noop => {}
   }
@@ -3274,7 +3988,7 @@ fn create_browser_window<T: UserEvent>(
     mut webview_attributes,
     platform_specific_attributes: _,
     uri_scheme_protocols,
-    ipc_handler: _,
+    ipc_handler,
     navigation_handler,
     new_window_handler,
     document_title_changed_handler,
@@ -3283,21 +3997,23 @@ fn create_browser_window<T: UserEvent>(
     web_resource_request_handler: _,
     mut on_page_load_handler,
     download_handler,
+    // TODO
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+      on_web_content_process_terminate_handler: _,
   } = webview;
 
   let address_changed_handler = address_changed_handler
     .map(|h| Arc::new(move |url: &url::Url| h(url)) as Arc<AddressChangedHandler>);
 
-  let initialization_scripts = std::mem::take(&mut webview_attributes.initialization_scripts)
-    .into_iter()
-    .map(CefInitScript::new)
-    .collect::<Vec<_>>();
-  let initialization_scripts = Arc::new(initialization_scripts);
+  let drag_drop_handler_enabled = webview_attributes.drag_drop_handler_enabled;
+  let initialization_scripts =
+    initialization_scripts_from_webview_attributes(&mut webview_attributes);
 
   let on_page_load_handler = on_page_load_handler.take().map(Arc::from);
   let document_title_changed_handler = document_title_changed_handler.map(Arc::from);
   let navigation_handler = navigation_handler.map(Arc::from);
   let new_window_handler = new_window_handler.map(Arc::from);
+  let ipc_handler: Option<Arc<IpcHandler<T>>> = ipc_handler.map(Arc::from);
 
   let devtools_enabled = (cfg!(debug_assertions) || cfg!(feature = "devtools"))
     && webview_attributes.devtools.unwrap_or(true);
@@ -3308,14 +4024,6 @@ fn create_browser_window<T: UserEvent>(
     "http"
   };
 
-  // Build cached domain names for custom schemes and clone protocols for storage
-  // before uri_scheme_protocols is moved
-  let scheme_keys: Vec<String> = uri_scheme_protocols.keys().cloned().collect();
-  let custom_scheme_domain_names: Vec<String> = scheme_keys
-    .iter()
-    .map(|scheme| format!("{scheme}.localhost"))
-    .collect();
-
   let uri_scheme_protocols: HashMap<String, Arc<Box<UriSchemeProtocolHandler>>> =
     uri_scheme_protocols
       .into_iter()
@@ -3323,6 +4031,10 @@ fn create_browser_window<T: UserEvent>(
       .collect();
 
   let custom_schemes = uri_scheme_protocols.keys().cloned().collect::<Vec<_>>();
+  let custom_scheme_domain_names = custom_schemes
+    .iter()
+    .map(|scheme| format!("{scheme}.localhost"))
+    .collect::<Vec<_>>();
 
   let mut request_context = request_context_from_webview_attributes(
     context,
@@ -3340,23 +4052,33 @@ fn create_browser_window<T: UserEvent>(
   let attributes = Arc::new(RefCell::new(window_builder));
 
   let initial_url = url.clone();
-  let url = CefString::from(url.as_str());
+  let url = CefString::from(INITIAL_LOAD_URL);
+  let suppressed_navigations = Arc::new(Mutex::new(vec![
+    url::Url::parse(INITIAL_LOAD_URL).expect("initial load data URL is valid"),
+    url::Url::parse(ABOUT_BLANK).expect("about:blank is a valid URL"),
+  ]));
+  let drag_drop_state = Arc::new(Mutex::new(DragDropState::default()));
 
   let mut client = BrowserClient::new(
     WindowKind::Browser,
     window_id,
-    initialization_scripts.clone(),
+    webview_id,
+    webview_label.clone(),
+    DragDropEventTarget::Window,
+    drag_drop_handler_enabled,
+    drag_drop_state,
+    ipc_handler,
     on_page_load_handler,
     document_title_changed_handler,
     navigation_handler,
+    suppressed_navigations.clone(),
     address_changed_handler,
     new_window_handler,
     download_handler,
     devtools_enabled,
-    custom_scheme_domain_names.clone(),
-    custom_protocol_scheme.to_string(),
     context.clone(),
-    Some(initial_url),
+    runtime_context(context),
+    None,
   );
 
   let mut bounds = cef::Rect {
@@ -3395,17 +4117,7 @@ fn create_browser_window<T: UserEvent>(
     eprintln!("Failed to create browser");
     return;
   };
-
-  let devtools_protocol_handlers = Arc::new(Mutex::new(Vec::<
-    Arc<dyn Fn(crate::DevToolsProtocol) + Send + Sync>,
-  >::new()));
-  let devtools_observer_registration = Arc::new(Mutex::new(add_dev_tools_observer(
-    &browser,
-    devtools_protocol_handlers.clone(),
-  )));
-
-  let browser = CefWebview::Browser(browser);
-  let browser_id_val = browser.browser_id();
+  let browser_id_val = browser.identifier();
 
   {
     let mut registry = context.scheme_handler_registry.lock().unwrap();
@@ -3420,6 +4132,27 @@ fn create_browser_window<T: UserEvent>(
       );
     }
   }
+  let devtools_protocol_handlers = Arc::new(Mutex::new(Vec::<
+    Arc<dyn Fn(crate::DevToolsProtocol) + Send + Sync>,
+  >::new()));
+  let pending_initial_loads = Arc::new(Mutex::new(HashMap::new()));
+  let devtools_observer_registration = Arc::new(Mutex::new(add_dev_tools_observer(
+    &browser,
+    devtools_protocol_handlers.clone(),
+    pending_initial_loads.clone(),
+  )));
+
+  load_initial_url_after_registering_initialization_scripts(
+    &browser,
+    &initialization_scripts,
+    custom_protocol_scheme,
+    &custom_scheme_domain_names,
+    &initial_url,
+    &suppressed_navigations,
+    &pending_initial_loads,
+  );
+
+  let browser = CefWebview::Browser(browser);
 
   context.windows.borrow_mut().insert(
     window_id,
@@ -3485,6 +4218,7 @@ pub(crate) fn create_window<T: UserEvent>(
     attributes.clone(),
     RefCell::new(Default::default()),
     RefCell::new(Default::default()),
+    RefCell::new(1.0),
     RefCell::new(false),
     context.clone(),
   );
@@ -3552,9 +4286,72 @@ wrap_task! {
   }
 }
 
+wrap_task! {
+  struct WebviewEventTask<T: UserEvent> {
+    context: Context<T>,
+    window_id: WindowId,
+    webview_id: u32,
+    event: WebviewEvent,
+  }
+
+  impl Task {
+    fn execute(&self) {
+      send_webview_event(
+        &self.context,
+        self.window_id,
+        self.webview_id,
+        self.event.clone(),
+      );
+    }
+  }
+}
+
+wrap_task! {
+  struct DragDropScriptEventTask<T: UserEvent> {
+    context: Context<T>,
+    window_id: WindowId,
+    webview_id: u32,
+    target: DragDropEventTarget,
+    drag_drop_state: Arc<Mutex<DragDropState>>,
+    event: DragDropScriptEvent,
+  }
+
+  impl Task {
+    fn execute(&self) {
+      handle_drag_drop_script_event(
+        &self.context,
+        self.window_id,
+        self.webview_id,
+        self.target,
+        self.drag_drop_state.clone(),
+        self.event.clone(),
+      );
+    }
+  }
+}
+
 #[cfg(target_os = "macos")]
 fn send_message_task<T: UserEvent>(context: &Context<T>, message: Message<T>) {
   let mut task = SendMessageTask::new(context.clone(), Arc::new(RefCell::new(message)));
+  cef::post_task(sys::cef_thread_id_t::TID_UI.into(), Some(&mut task));
+}
+
+fn post_drag_drop_script_event<T: UserEvent>(
+  context: Context<T>,
+  window_id: WindowId,
+  webview_id: u32,
+  target: DragDropEventTarget,
+  drag_drop_state: Arc<Mutex<DragDropState>>,
+  event: DragDropScriptEvent,
+) {
+  let mut task = DragDropScriptEventTask::new(
+    context,
+    window_id,
+    webview_id,
+    target,
+    drag_drop_state,
+    event,
+  );
   cef::post_task(sys::cef_thread_id_t::TID_UI.into(), Some(&mut task));
 }
 
@@ -3580,15 +4377,130 @@ fn send_window_event<T: UserEvent>(
 
     drop(windows_ref);
 
-    {
+    in_callback(|| {
       let listeners = window_event_listeners.lock().unwrap();
       let handlers: Vec<_> = listeners.values().collect();
       for handler in handlers.iter() {
         handler(&event);
       }
+    });
+
+    in_callback(|| (callback.borrow())(RunEvent::WindowEvent { label, event }));
+  }
+}
+
+fn send_webview_event<T: UserEvent>(
+  context: &Context<T>,
+  window_id: WindowId,
+  webview_id: u32,
+  event: WebviewEvent,
+) {
+  let Ok(windows_ref) = context.windows.try_borrow() else {
+    let mut task = WebviewEventTask::new(context.clone(), window_id, webview_id, event.clone());
+    cef::post_task(sys::cef_thread_id_t::TID_UI.into(), Some(&mut task));
+    return;
+  };
+
+  let Some(w) = windows_ref.get(&window_id) else {
+    return;
+  };
+
+  let listeners = w.webview_event_listeners.clone();
+  drop(windows_ref);
+
+  let Some(webview_listeners) = listeners.lock().unwrap().get(&webview_id).cloned() else {
+    return;
+  };
+
+  in_callback(|| {
+    let listeners = webview_listeners.lock().unwrap();
+    let handlers: Vec<_> = listeners.values().collect();
+    for handler in handlers.iter() {
+      handler(&event);
+    }
+  });
+}
+
+fn send_drag_drop_event<T: UserEvent>(
+  context: &Context<T>,
+  window_id: WindowId,
+  webview_id: u32,
+  target: DragDropEventTarget,
+  event: DragDropEvent,
+) {
+  match target {
+    DragDropEventTarget::Window => send_window_event(
+      window_id,
+      &context.windows,
+      &context.callback,
+      WindowEvent::DragDrop(event),
+    ),
+    DragDropEventTarget::Webview => send_webview_event(
+      context,
+      window_id,
+      webview_id,
+      WebviewEvent::DragDrop(event),
+    ),
+  }
+}
+
+fn handle_drag_drop_script_event<T: UserEvent>(
+  context: &Context<T>,
+  window_id: WindowId,
+  webview_id: u32,
+  target: DragDropEventTarget,
+  drag_drop_state: Arc<Mutex<DragDropState>>,
+  script_event: DragDropScriptEvent,
+) {
+  let position = PhysicalPosition::new(script_event.x, script_event.y);
+  let event = {
+    let mut state = drag_drop_state.lock().unwrap();
+    if !state.native_entered {
+      return;
     }
 
-    (callback.borrow())(RunEvent::WindowEvent { label, event });
+    match script_event.kind.as_str() {
+      "enter" => {
+        if state.entered {
+          return;
+        }
+
+        let Some(paths) = state.paths.clone() else {
+          return;
+        };
+        state.entered = true;
+        Some(DragDropEvent::Enter { paths, position })
+      }
+      "over" => {
+        if state.entered {
+          Some(DragDropEvent::Over { position })
+        } else {
+          None
+        }
+      }
+      "drop" => {
+        let paths = state.entered.then(|| state.paths.take()).flatten();
+        state.entered = false;
+        state.native_entered = false;
+        paths.map(|paths| DragDropEvent::Drop { paths, position })
+      }
+      "leave" => {
+        state.native_entered = false;
+        state.paths = None;
+
+        if state.entered {
+          state.entered = false;
+          Some(DragDropEvent::Leave)
+        } else {
+          None
+        }
+      }
+      _ => None,
+    }
+  };
+
+  if let Some(event) = event {
+    send_drag_drop_event(context, window_id, webview_id, target, event);
   }
 }
 
@@ -3719,7 +4631,7 @@ pub(crate) fn create_webview<T: UserEvent>(
     mut webview_attributes,
     platform_specific_attributes,
     uri_scheme_protocols,
-    ipc_handler: _,
+    ipc_handler,
     navigation_handler,
     new_window_handler,
     document_title_changed_handler,
@@ -3728,6 +4640,9 @@ pub(crate) fn create_webview<T: UserEvent>(
     web_resource_request_handler: _,
     mut on_page_load_handler,
     download_handler,
+    // TODO
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+      on_web_content_process_terminate_handler: _,
   } = pending;
 
   let address_changed_handler = address_changed_handler
@@ -3746,16 +4661,15 @@ pub(crate) fn create_webview<T: UserEvent>(
     }
   };
 
-  let initialization_scripts = std::mem::take(&mut webview_attributes.initialization_scripts)
-    .into_iter()
-    .map(CefInitScript::new)
-    .collect::<Vec<_>>();
-  let initialization_scripts = Arc::new(initialization_scripts);
+  let drag_drop_handler_enabled = webview_attributes.drag_drop_handler_enabled;
+  let initialization_scripts =
+    initialization_scripts_from_webview_attributes(&mut webview_attributes);
 
   let on_page_load_handler = on_page_load_handler.take().map(Arc::from);
   let document_title_changed_handler = document_title_changed_handler.map(Arc::from);
   let navigation_handler = navigation_handler.map(Arc::from);
   let new_window_handler = new_window_handler.map(Arc::from);
+  let ipc_handler: Option<Arc<IpcHandler<T>>> = ipc_handler.map(Arc::from);
 
   let devtools_enabled = (cfg!(debug_assertions) || cfg!(feature = "devtools"))
     && webview_attributes.devtools.unwrap_or(true);
@@ -3767,29 +4681,44 @@ pub(crate) fn create_webview<T: UserEvent>(
   };
 
   let custom_schemes = uri_scheme_protocols.keys().cloned().collect::<Vec<_>>();
-  let custom_scheme_domain_names: Vec<String> = custom_schemes
+  let custom_scheme_domain_names = custom_schemes
     .iter()
     .map(|scheme| format!("{scheme}.localhost"))
-    .collect();
+    .collect::<Vec<_>>();
 
   let initial_url = url.clone();
-  let url = CefString::from(url.as_str());
+  let url = CefString::from(INITIAL_LOAD_URL);
+  let suppressed_navigations = Arc::new(Mutex::new(vec![
+    url::Url::parse(INITIAL_LOAD_URL).expect("initial load data URL is valid"),
+    url::Url::parse(ABOUT_BLANK).expect("about:blank is a valid URL"),
+  ]));
+  let drag_drop_state = Arc::new(Mutex::new(DragDropState::default()));
+  let drag_drop_event_target = if kind == WebviewKind::WindowContent {
+    DragDropEventTarget::Window
+  } else {
+    DragDropEventTarget::Webview
+  };
 
   let mut client = BrowserClient::new(
     WindowKind::Tauri,
     window_id,
-    initialization_scripts.clone(),
+    webview_id,
+    label.clone(),
+    drag_drop_event_target,
+    drag_drop_handler_enabled,
+    drag_drop_state,
+    ipc_handler,
     on_page_load_handler,
     document_title_changed_handler,
     navigation_handler,
+    suppressed_navigations.clone(),
     address_changed_handler,
     new_window_handler,
     download_handler,
     devtools_enabled,
-    custom_scheme_domain_names.clone(),
-    custom_protocol_scheme.to_string(),
     context.clone(),
-    Some(initial_url.clone()),
+    runtime_context(context),
+    None,
   );
 
   let uri_scheme_protocols: HashMap<String, Arc<Box<UriSchemeProtocolHandler>>> =
@@ -3836,7 +4765,6 @@ pub(crate) fn create_webview<T: UserEvent>(
     } else {
       CefRuntimeStyle::Chrome
     });
-
   let cef_runtime_style: RuntimeStyle = match runtime_style {
     CefRuntimeStyle::Alloy => cef_runtime_style_t::CEF_RUNTIME_STYLE_ALLOY.into(),
     CefRuntimeStyle::Chrome => cef_runtime_style_t::CEF_RUNTIME_STYLE_CHROME.into(),
@@ -3863,15 +4791,44 @@ pub(crate) fn create_webview<T: UserEvent>(
       eprintln!("Failed to create browser");
       return;
     };
-
-    // On Windows, set the browser window to be topmost to esnure correct z-order
-    #[cfg(windows)]
-    set_browser_on_top(&browser_host);
+    let browser_id_val = browser_host.identifier();
+    {
+      let mut registry = context.scheme_handler_registry.lock().unwrap();
+      for (scheme, handler) in &uri_scheme_protocols {
+        registry.insert(
+          (browser_id_val, scheme.clone()),
+          (
+            label.clone(),
+            handler.clone(),
+            initialization_scripts.clone(),
+          ),
+        );
+      }
+    }
 
     let devtools_protocol_handlers = Arc::new(Mutex::new(Vec::<
       Arc<dyn Fn(crate::DevToolsProtocol) + Send + Sync>,
     >::new()));
-    let devtools_observer_registration = Arc::new(Mutex::new(None));
+    let pending_initial_loads = Arc::new(Mutex::new(HashMap::new()));
+    let devtools_observer_registration = Arc::new(Mutex::new(add_dev_tools_observer(
+      &browser_host,
+      devtools_protocol_handlers.clone(),
+      pending_initial_loads.clone(),
+    )));
+
+    load_initial_url_after_registering_initialization_scripts(
+      &browser_host,
+      &initialization_scripts,
+      custom_protocol_scheme,
+      &custom_scheme_domain_names,
+      &initial_url,
+      &suppressed_navigations,
+      &pending_initial_loads,
+    );
+
+    // On Windows, set the browser window to be topmost to esnure correct z-order
+    #[cfg(windows)]
+    set_browser_on_top(&browser_host);
 
     let browser = CefWebview::Browser(browser_host);
 
@@ -3894,21 +4851,6 @@ pub(crate) fn create_webview<T: UserEvent>(
     } else {
       None
     };
-
-    let browser_id_val = browser.browser_id();
-    {
-      let mut registry = context.scheme_handler_registry.lock().unwrap();
-      for (scheme, handler) in &uri_scheme_protocols {
-        registry.insert(
-          (browser_id_val, scheme.clone()),
-          (
-            label.clone(),
-            handler.clone(),
-            initialization_scripts.clone(),
-          ),
-        );
-      }
-    }
 
     context
       .windows
@@ -3936,6 +4878,7 @@ pub(crate) fn create_webview<T: UserEvent>(
       Arc<dyn Fn(crate::DevToolsProtocol) + Send + Sync>,
     >::new()));
     let devtools_observer_registration = Arc::new(Mutex::new(None));
+    let pending_initial_loads = Arc::new(Mutex::new(HashMap::new()));
     let webview_attributes = Arc::new(RefCell::new(webview_attributes));
 
     #[allow(clippy::unnecessary_find_map)]
@@ -3946,6 +4889,11 @@ pub(crate) fn create_webview<T: UserEvent>(
       label.clone(),
       uri_scheme_protocols.clone(),
       initialization_scripts.clone(),
+      custom_protocol_scheme.to_string(),
+      custom_scheme_domain_names.clone(),
+      initial_url.clone(),
+      suppressed_navigations.clone(),
+      pending_initial_loads,
       devtools_protocol_handlers.clone(),
       devtools_observer_registration.clone(),
       webview_attributes.clone(),

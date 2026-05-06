@@ -217,6 +217,7 @@ enum WindowMessage {
 pub enum WebviewMessage {
   AddEventListener(WebviewEventId, Box<dyn Fn(&WebviewEvent) + Send>),
   EvaluateScript(String),
+  EvaluateScriptWithCallback(String, Box<dyn Fn(String) + Send + 'static>),
   CookiesForUrl(Url, Sender<Result<Vec<Cookie<'static>>>>),
   Cookies(Sender<Result<Vec<Cookie<'static>>>>),
   SetCookie(Cookie<'static>),
@@ -359,20 +360,20 @@ unsafe impl<T: UserEvent> Sync for RuntimeContext<T> {}
 
 impl<T: UserEvent> RuntimeContext<T> {
   fn post_message(&self, message: Message<T>) -> Result<()> {
-    if thread::current().id() == self.main_thread_id {
-      // Already on main thread, execute directly
+    if thread::current().id() == self.main_thread_id && !cef_impl::is_in_event_callback() {
+      // On main thread and not inside a user callback, execute directly.
       cef_impl::handle_message(&self.cef_context, message);
-      Ok(())
     } else {
-      // Post to main thread via TaskRunner
+      // Off main thread, or inside a user callback where synchronous execution
+      // could cause re-entrancy and deadlocks. Defer through the CEF TaskRunner.
       self
         .main_thread_task_runner
         .post_task(Some(&mut cef_impl::SendMessageTask::new(
           self.cef_context.clone(),
           Arc::new(RefCell::new(message)),
         )));
-      Ok(())
     }
+    Ok(())
   }
 
   fn create_window<F: Fn(RawWindow) + Send + 'static>(
@@ -1183,6 +1184,18 @@ impl<T: UserEvent> WebviewDispatch<T> for CefWebviewDispatcher<T> {
       window_id: *self.window_id.lock().unwrap(),
       webview_id: self.webview_id,
       message: WebviewMessage::EvaluateScript(script.into()),
+    })
+  }
+
+  fn eval_script_with_callback<S: Into<String>>(
+    &self,
+    script: S,
+    callback: impl Fn(String) + Send + 'static,
+  ) -> Result<()> {
+    self.context.post_message(Message::Webview {
+      window_id: *self.window_id.lock().unwrap(),
+      webview_id: self.webview_id,
+      message: WebviewMessage::EvaluateScriptWithCallback(script.into(), Box::new(callback)),
     })
   }
 
@@ -2103,7 +2116,6 @@ impl<T: UserEvent> CefRuntime<T> {
 
       if !is_helper {
         let event_tx_ = event_tx.clone();
-        let windows_ = windows.clone();
         init_ns_app(Box::new(move |event| match event {
           AppDelegateEvent::ShouldTerminate { tx } => {
             // Cancel macOS termination — we handle shutdown ourselves.
@@ -2322,9 +2334,11 @@ pub fn run_cef_helper_process() {
     loader
   };
 
+  let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+  let mut app = cef_impl::TauriRenderApp::new();
   cef::execute_process(
     Some(args.as_main_args()),
-    None::<&mut cef::App>,
+    Some(&mut app),
     std::ptr::null_mut(),
   );
 }
@@ -2369,6 +2383,10 @@ impl InitAttribute for RuntimeInitAttribute {
 /// Webview attributes.
 pub enum WebviewAtribute {
   /// Sets the browser runtime style.
+  ///
+  /// External file drag and drop events require [`RuntimeStyle::Alloy`].
+  /// CEF's Chrome runtime does not currently route those events through
+  /// `CefDragHandler`, so Tauri drag/drop events will not be emitted there.
   RuntimeStyle { style: RuntimeStyle },
 }
 
@@ -2378,10 +2396,15 @@ pub enum RuntimeStyle {
   /// Alloy runtime.
   ///
   /// Used by default on multiwebview mode.
+  ///
+  /// Required for Tauri drag/drop events because CEF routes external file
+  /// drags through `CefDragHandler` only for Alloy-style webviews.
   Alloy,
   /// Chrome runtime.
   ///
   /// Used by default on webview window mode.
+  ///
+  /// Does not currently support Tauri drag/drop events for external files.
   ///
   /// Only a single browser view can use the Chrome runtime in a given window.
   Chrome,

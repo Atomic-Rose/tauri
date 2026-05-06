@@ -18,9 +18,11 @@ use tauri::{
 use tauri::{Manager, RunEvent};
 use tauri_plugin_sample::{PingRequest, SampleExt};
 
-#[cfg(feature = "cef")]
+#[cfg(test)]
+type TauriRuntime = tauri::test::MockRuntime;
+#[cfg(all(not(test), feature = "cef"))]
 type TauriRuntime = tauri::Cef;
-#[cfg(not(feature = "cef"))]
+#[cfg(all(not(test), not(feature = "cef")))]
 type TauriRuntime = tauri::Wry;
 
 #[derive(Clone, Serialize)]
@@ -37,7 +39,7 @@ pub struct PopupMenu<R: Runtime>(#[allow(dead_code)] tauri::menu::Menu<R>);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg_attr(feature = "cef", tauri::cef_entry_point)]
 pub fn run() {
-  run_app(tauri::Builder::<TauriRuntime>::default(), |_app| {});
+  run_app(tauri::Builder::<TauriRuntime>::new(), |_app| {});
 }
 
 pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
@@ -95,7 +97,7 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
 
             let number = created_window_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let builder = tauri::WebviewWindowBuilder::new(
+            let builder = WebviewWindowBuilder::new(
               &app_,
               format!("new-{number}"),
               tauri::WebviewUrl::External(if cfg!(feature = "cef") {
@@ -229,18 +231,19 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
   #[cfg(target_os = "macos")]
   app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
+  #[cfg(target_os = "ios")]
+  let mut counter = 0;
   app.run(move |_app_handle, _event| {
-    #[cfg(all(desktop, not(test)))]
+    #[cfg(not(test))]
     match &_event {
       #[cfg(not(feature = "cef"))]
-      RunEvent::ExitRequested { api, code, .. } => {
+      RunEvent::ExitRequested { api, code, .. } if code.is_none() => {
         // Keep the event loop running even if all windows are closed
         // This allow us to catch tray icon events when there is no window
         // if we manually requested an exit (code is Some(_)) we will let it go through
-        if code.is_none() {
-          api.prevent_exit();
-        }
+        api.prevent_exit();
       }
+      #[cfg(desktop)]
       RunEvent::WindowEvent {
         event: tauri::WindowEvent::CloseRequested { api, .. },
         label,
@@ -255,6 +258,20 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
           .unwrap()
           .destroy()
           .unwrap();
+      }
+      #[cfg(target_os = "ios")]
+      RunEvent::SceneRequested { .. } => {
+        counter += 1;
+        WebviewWindowBuilder::new(
+          _app_handle,
+          format!("main-from-scene-{counter}"),
+          WebviewUrl::default(),
+        )
+        .build()
+        .unwrap();
+      }
+      RunEvent::Opened { urls } => {
+        println!("opened urls: {:?}", urls);
       }
       _ => (),
     }
