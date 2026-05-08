@@ -60,7 +60,10 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   log::info!(action = "Bundling"; "{} ({})", package_name, package_path.display());
 
   let license = settings.license().unwrap_or_default();
-  let name = heck::AsKebabCase(settings.product_name()).to_string();
+  // MUSE fork: derive RPM Name: from main_binary_name so the package identifier
+  // matches the installed binary (e.g. "muse-writer"). Upstream kebab-cases
+  // product_name, which produces a styled name (e.g. "MUSE" → "muse").
+  let name = heck::AsKebabCase(settings.main_binary_name()?).to_string();
 
   let compression = settings
     .rpm()
