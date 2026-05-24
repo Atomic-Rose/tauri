@@ -419,6 +419,42 @@ fn set_window_icon(window: &cef::Window, icon: tauri_runtime::Icon<'static>) {
   }
 }
 
+#[cfg(target_os = "linux")]
+fn set_window_class(window: &cef::Window) {
+  use std::ffi::CString;
+  use x11_dl::xlib;
+
+  let Some(class_name) = std::env::current_exe()
+    .ok()
+    .and_then(|path| path.file_name().map(|name| name.to_owned()))
+    .and_then(|name| name.into_string().ok())
+    .and_then(|name| CString::new(name).ok())
+  else {
+    return;
+  };
+
+  let Some(xlib) = xlib::Xlib::open().ok() else {
+    return;
+  };
+
+  unsafe {
+    let display = (xlib.XOpenDisplay)(std::ptr::null());
+    if display.is_null() {
+      return;
+    }
+
+    let xid = window.window_handle() as xlib::Window;
+    let mut class_hint = xlib::XClassHint {
+      res_name: class_name.as_ptr() as *mut _,
+      res_class: class_name.as_ptr() as *mut _,
+    };
+
+    (xlib.XSetClassHint)(display, xid, &mut class_hint);
+    (xlib.XFlush)(display);
+    (xlib.XCloseDisplay)(display);
+  }
+}
+
 /// Set overlay icon using CEF native API (set_window_app_icon)
 fn set_overlay_icon(window: &cef::Window, icon: Option<tauri_runtime::Icon<'static>>) {
   match icon {
@@ -2027,6 +2063,9 @@ wrap_window_delegate! {
         // Setup necessary handling for `start_window_dragging` to work on Windows
         #[cfg(windows)]
         drag_window::windows::subclass_window_for_dragging(window);
+
+        #[cfg(target_os = "linux")]
+        set_window_class(window);
 
         let a = self.attributes.borrow();
         #[cfg(target_os = "macos")]
