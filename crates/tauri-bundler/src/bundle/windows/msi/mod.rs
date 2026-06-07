@@ -1175,7 +1175,6 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourceMap> {
 
     let mut locales = Vec::with_capacity(locale_names.len());
     for f in locale_names {
-      let target_file = PathBuf::from("locales").join(f);
       let from = cef_path.join("locales").join(f);
       let path = dunce::simplified(&locales_out.join(f)).to_path_buf();
       fs::copy(&from, &path).fs_context("failed to copy CEF locale for MSI bundle", from)?;

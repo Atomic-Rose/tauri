@@ -5092,7 +5092,6 @@ fn request_context_from_webview_attributes<T: UserEvent>(
     CefStringUtf16::from("")
   } else if let Some(_data_directory) = &webview_attributes.data_directory {
     // TODO: setting a custom data directory must be a child of the root data directory, but it returns None on browser_view_create
-    eprintln!("data directory is not yet implemented");
     (&global_context.cache_path()).into()
     // CefStringUtf16::from(data_directory.to_string_lossy().as_ref())
   } else {

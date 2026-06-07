@@ -65,8 +65,8 @@ pub mod windows {
     }
 
     // For other messages, call the original CEF window procedure
-    let original_wnd_proc = GetPropW(hwnd, ORIGINAL_WND_PROP);
-    let original_wnd_proc = std::mem::transmute::<_, WindowProc>(original_wnd_proc.0);
-    CallWindowProcW(Some(original_wnd_proc), hwnd, msg, wparam, lparam)
+    let original_wnd_proc = unsafe { GetPropW(hwnd, ORIGINAL_WND_PROP) };
+    let original_wnd_proc = unsafe { std::mem::transmute::<_, WindowProc>(original_wnd_proc.0) };
+    unsafe { CallWindowProcW(Some(original_wnd_proc), hwnd, msg, wparam, lparam) }
   }
 }
