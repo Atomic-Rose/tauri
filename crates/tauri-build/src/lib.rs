@@ -757,7 +757,6 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
   Ok(())
 }
 
-#[cfg(test)]
 fn to_winres_version(v: &semver::Version) -> u64 {
   let build = v.build.parse::<u16>().map(u64::from).unwrap_or(0);
 
