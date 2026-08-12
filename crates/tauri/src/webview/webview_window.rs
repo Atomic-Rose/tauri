@@ -60,15 +60,6 @@ impl<'a, M: Manager<crate::Cef>> WebviewWindowBuilder<'a, crate::Cef, M> {
     self.webview_builder = self.webview_builder.browser_runtime_style(style);
     self
   }
-
-  /// Crete a full Chrome browser window.
-  ///
-  /// In this case most window builder options are ignored,
-  /// as we can only control the size and position of the window.
-  pub fn browser_window(mut self) -> Self {
-    self.window_builder.window_builder = self.window_builder.window_builder.browser_window();
-    self
-  }
 }
 
 impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
@@ -642,6 +633,16 @@ impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
     self
   }
 
+  /// This sets `WS_EX_NOREDIRECTIONBITMAP`.
+  ///
+  /// This can avoid the white flash that may appear before the webview content is rendered
+  /// when using a transparent window. **Windows only**.
+  #[must_use]
+  pub fn no_redirection_bitmap(mut self, enable: bool) -> Self {
+    self.window_builder = self.window_builder.no_redirection_bitmap(enable);
+    self
+  }
+
   /// Sets whether or not the window has shadow.
   ///
   /// ## Platform-specific
@@ -755,7 +756,9 @@ impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
     self
   }
 
-  /// Enables or disables drag and drop support.
+  /// Enables or disables drag and drop support of this window.
+  ///
+  /// Note: this is a different config from [`Self::disable_drag_drop_handler`]
   #[cfg(windows)]
   #[must_use]
   pub fn drag_and_drop(mut self, enabled: bool) -> Self {
@@ -1073,7 +1076,9 @@ impl<R: Runtime, M: Manager<R>> WebviewWindowBuilder<'_, R, M> {
     self
   }
 
-  /// Disables the drag and drop handler. This is required to use HTML5 drag and drop APIs on the frontend on Windows.
+  /// Disables the webview drag and drop handler used internally to generate [`DragDropEvent`](crate::DragDropEvent)s.
+  ///
+  /// This is required to use HTML5 drag and drop APIs on the frontend on Windows since we replace the drag drop handler of WebView2.
   #[must_use]
   pub fn disable_drag_drop_handler(mut self) -> Self {
     self.webview_builder = self.webview_builder.disable_drag_drop_handler();
@@ -1119,6 +1124,9 @@ impl<R: Runtime, M: Manager<R>> WebviewWindowBuilder<'_, R, M> {
 
   /// Whether the window should be transparent. If this is true, writing colors
   /// with alpha values different than `1.0` will produce a transparent window.
+  ///
+  /// On Windows, using `no_redirection_bitmap` can help avoid a white flash when
+  /// creating a transparent window.
   #[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]
   #[cfg_attr(
     docsrs,
@@ -1313,26 +1321,24 @@ impl<R: Runtime, M: Manager<R>> WebviewWindowBuilder<'_, R, M> {
   /// # Examples
   ///
   /// ```
-  /// fn main() {
-  ///   tauri::Builder::<tauri::Wry>::new()
-  ///     .setup(|app| {
-  ///       let mut builder = tauri::WebviewWindowBuilder::new(app, "label", tauri::WebviewUrl::App("index.html".into()));
-  ///       #[cfg(target_os = "ios")]
-  ///       {
-  ///         window_builder = window_builder.with_input_accessory_view_builder(|_webview| unsafe {
-  ///           let mtm = objc2::MainThreadMarker::new_unchecked();
-  ///           let button = objc2_ui_kit::UIButton::buttonWithType(objc2_ui_kit::UIButtonType(1), mtm);
-  ///           button.setTitle_forState(
-  ///             Some(&objc2_foundation::NSString::from_str("Tauri")),
-  ///             objc2_ui_kit::UIControlState(0),
-  ///           );
-  ///           Some(button.downcast().unwrap())
-  ///         });
-  ///       }
-  ///       let webview = builder.build()?;
-  ///       Ok(())
-  ///     });
-  /// }
+  /// tauri::Builder::<tauri::Wry>::new()
+  ///   .setup(|app| {
+  ///     let mut builder = tauri::WebviewWindowBuilder::new(app, "label", tauri::WebviewUrl::App("index.html".into()));
+  ///     #[cfg(target_os = "ios")]
+  ///     {
+  ///       window_builder = window_builder.with_input_accessory_view_builder(|_webview| unsafe {
+  ///         let mtm = objc2::MainThreadMarker::new_unchecked();
+  ///         let button = objc2_ui_kit::UIButton::buttonWithType(objc2_ui_kit::UIButtonType(1), mtm);
+  ///         button.setTitle_forState(
+  ///           Some(&objc2_foundation::NSString::from_str("Tauri")),
+  ///           objc2_ui_kit::UIControlState(0),
+  ///         );
+  ///         Some(button.downcast().unwrap())
+  ///       });
+  ///     }
+  ///     let webview = builder.build()?;
+  ///     Ok(())
+  ///   });
   /// ```
   ///
   /// # Stability
@@ -1675,16 +1681,28 @@ impl<R: Runtime> WebviewWindow<R> {
   }
 
   /// Hides the window menu.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **macOS:** Unsupported.
   pub fn hide_menu(&self) -> crate::Result<()> {
     self.window.hide_menu()
   }
 
   /// Shows the window menu.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **macOS:** Unsupported.
   pub fn show_menu(&self) -> crate::Result<()> {
     self.window.show_menu()
   }
 
   /// Shows the window menu.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **macOS:** Unsupported.
   pub fn is_menu_visible(&self) -> crate::Result<bool> {
     self.window.is_menu_visible()
   }
@@ -2335,8 +2353,20 @@ impl<R: Runtime> WebviewWindow<R> {
   ///
   /// The closure is executed on the main thread.
   ///
-  /// Note that `webview2-com`, `webkit2gtk`, `objc2_web_kit` and similar crates may be updated in minor releases of Tauri.
+  /// Note that `webview2-com`, `webkit2gtk`, `objc2_web_kit`, `cef` (in case of CEF runtime) and similar crates may be updated in minor releases of Tauri.
   /// Therefore it's recommended to pin Tauri to at least a minor version when you're using `with_webview`.
+  ///
+  /// The closure receives a [`PlatformWebview`](crate::webview::PlatformWebview), which dereferences
+  /// to the webview type defined by the active runtime:
+  ///
+  #[cfg_attr(
+    feature = "wry",
+    doc = "- With the wry runtime: [`tauri_runtime_wry::Webview`]."
+  )]
+  #[cfg_attr(
+    feature = "cef",
+    doc = "- With the CEF runtime: [`tauri_runtime_cef::Webview`], whose underlying CEF browser is accessible via [`browser`](tauri_runtime_cef::Webview::browser)."
+  )]
   ///
   /// # Examples
   ///
@@ -2387,9 +2417,9 @@ impl<R: Runtime> WebviewWindow<R> {
   /// }
   /// ```
   #[allow(clippy::needless_doctest_main)] // To avoid a large diff
-  #[cfg(feature = "wry")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "wry")))]
-  pub fn with_webview<F: FnOnce(crate::webview::PlatformWebview) + Send + 'static>(
+  #[cfg(any(feature = "wry", feature = "cef"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "wry", feature = "cef"))))]
+  pub fn with_webview<F: FnOnce(crate::webview::PlatformWebview<R>) + Send + 'static>(
     &self,
     f: F,
   ) -> crate::Result<()> {

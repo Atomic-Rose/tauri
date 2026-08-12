@@ -612,6 +612,16 @@ impl<'a, R: Runtime, M: Manager<R>> WindowBuilder<'a, R, M> {
     self
   }
 
+  /// This sets `WS_EX_NOREDIRECTIONBITMAP`.
+  ///
+  /// This can avoid the white flash that may appear before the webview content is rendered
+  /// when using a transparent window. **Windows only**.
+  #[must_use]
+  pub fn no_redirection_bitmap(mut self, enable: bool) -> Self {
+    self.window_builder = self.window_builder.no_redirection_bitmap(enable);
+    self
+  }
+
   /// Sets whether or not the window has shadow.
   ///
   /// ## Platform-specific
@@ -915,6 +925,9 @@ impl<'a, R: Runtime, M: Manager<R>> WindowBuilder<'a, R, M> {
 
   /// Whether the window should be transparent. If this is true, writing colors
   /// with alpha values different than `1.0` will produce a transparent window.
+  ///
+  /// On Windows, using `no_redirection_bitmap` can help avoid a white flash when
+  /// creating a transparent window.
   #[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]
   #[cfg_attr(
     docsrs,
@@ -1331,7 +1344,7 @@ tauri::Builder::<tauri::Wry>::new()
     let prev_menu = self.menu_lock().take().map(|m| m.menu);
 
     // remove from the window
-    #[cfg_attr(target_os = "macos", allow(unused_variables))]
+    #[cfg(not(target_os = "macos"))]
     if let Some(menu) = &prev_menu {
       let window = self.clone();
       let menu = menu.clone();
@@ -1361,9 +1374,13 @@ tauri::Builder::<tauri::Wry>::new()
   }
 
   /// Hides the window menu.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **macOS:** Unsupported.
   pub fn hide_menu(&self) -> crate::Result<()> {
     // remove from the window
-    #[cfg_attr(target_os = "macos", allow(unused_variables))]
+    #[cfg(not(target_os = "macos"))]
     if let Some(window_menu) = &*self.menu_lock() {
       let window = self.clone();
       let menu_ = window_menu.menu.clone();
@@ -1389,9 +1406,13 @@ tauri::Builder::<tauri::Wry>::new()
   }
 
   /// Shows the window menu.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **macOS:** Unsupported.
   pub fn show_menu(&self) -> crate::Result<()> {
     // remove from the window
-    #[cfg_attr(target_os = "macos", allow(unused_variables))]
+    #[cfg(not(target_os = "macos"))]
     if let Some(window_menu) = &*self.menu_lock() {
       let window = self.clone();
       let menu_ = window_menu.menu.clone();
@@ -1417,9 +1438,13 @@ tauri::Builder::<tauri::Wry>::new()
   }
 
   /// Shows the window menu.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **macOS:** Unsupported.
   pub fn is_menu_visible(&self) -> crate::Result<bool> {
     // remove from the window
-    #[cfg_attr(target_os = "macos", allow(unused_variables))]
+    #[cfg(not(target_os = "macos"))]
     if let Some(window_menu) = &*self.menu_lock() {
       let (tx, rx) = std::sync::mpsc::channel();
       let window = self.clone();

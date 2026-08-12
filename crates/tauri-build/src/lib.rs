@@ -226,6 +226,8 @@ fn default_windows_app_manifest() -> &'static str {
 #[derive(Debug)]
 pub struct WindowsAttributes {
   window_icon_path: Option<PathBuf>,
+  /// Whether to statically link the Visual C++ runtime into the application binary on Windows MSVC targets
+  static_vc_runtime: Option<bool>,
   /// A string containing an [application manifest] to be included with the application on Windows.
   ///
   /// Defaults to:
@@ -268,8 +270,9 @@ impl WindowsAttributes {
   pub fn new() -> Self {
     Self {
       window_icon_path: Default::default(),
-      app_manifest: Some(default_windows_app_manifest().into()),
+      static_vc_runtime: None,
       append_rc_content: Vec::new(),
+      app_manifest: Some(default_windows_app_manifest().into()),
     }
   }
 
@@ -279,6 +282,7 @@ impl WindowsAttributes {
     Self {
       app_manifest: None,
       window_icon_path: Default::default(),
+      static_vc_runtime: None,
       append_rc_content: Vec::new(),
     }
   }
@@ -290,6 +294,15 @@ impl WindowsAttributes {
     self
       .window_icon_path
       .replace(window_icon_path.as_ref().into());
+    self
+  }
+
+  /// Sets whether to statically link the Visual C++ runtime into the application binary on Windows MSVC targets.
+  ///
+  /// If unset, this is read from `build > windows > staticVCRuntime` in the Tauri configuration.
+  #[must_use]
+  pub fn static_vc_runtime(mut self, static_vc_runtime: bool) -> Self {
+    self.static_vc_runtime.replace(static_vc_runtime);
     self
   }
 
@@ -502,6 +515,7 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
     json_patch::merge(&mut config, &merge_config);
   }
   let config: Config = serde_json::from_value(config)?;
+  let static_vc_runtime = should_static_link_vc_runtime(&config, &attributes);
 
   let s = config.identifier.split('.');
   let last = s.clone().count() - 1;
@@ -614,8 +628,13 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
     );
   }
 
-  if !is_dev() && target_triple.contains("unknown-linux-gnu") {
-    // TODO: Only needed for CEF.
+  if target_triple.contains("unknown-linux-gnu")
+    && env::var("DEP_TAURI_RUNTIME").as_deref() == Ok("cef")
+  {
+    // The executable links against libcef.so, which sits next to it: the
+    // cef-dll-sys build script copies the CEF distribution into the cargo
+    // target directory for dev, and the bundler ships it alongside the binary
+    // in packages. `$ORIGIN` makes the loader look there in both cases.
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
   }
 
@@ -650,7 +669,7 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
     if let Some(version_str) = &config.version
       && let Ok(v) = Version::parse(version_str)
     {
-      let version = (v.major << 48) | (v.minor << 32) | (v.patch << 16);
+      let version = to_winres_version(&v);
       res.set_version_info(VersionInfo::FILEVERSION, version);
       res.set_version_info(VersionInfo::PRODUCTVERSION, version);
       res.set("FileVersion", version_str);
@@ -723,7 +742,7 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
           }
         }
       }
-      "msvc" if env::var_os("STATIC_VCRUNTIME").is_some_and(|v| v == "true") => {
+      "msvc" if static_vc_runtime => {
         static_vcruntime::build();
       }
       _ => (),
@@ -743,6 +762,20 @@ fn to_winres_version(v: &semver::Version) -> u64 {
   let build = v.build.parse::<u16>().map(u64::from).unwrap_or(0);
 
   (v.major << 48) | (v.minor << 32) | (v.patch << 16) | build
+}
+
+fn should_static_link_vc_runtime(config: &Config, attributes: &Attributes) -> bool {
+  if let Some(value) = env::var_os("STATIC_VCRUNTIME") {
+    println!(
+      "cargo:warning=STATIC_VCRUNTIME is deprecated; use build.windows.staticVCRuntime in tauri.conf.json or tauri_build::WindowsAttributes::static_vc_runtime instead."
+    );
+    value != "false"
+  } else {
+    attributes
+      .windows_attributes
+      .static_vc_runtime
+      .unwrap_or(config.build.windows.static_vc_runtime)
+  }
 }
 
 #[cfg(test)]
@@ -787,5 +820,87 @@ mod tests {
       crate::to_winres_version(&version),
       (1 << 48) | (2 << 32) | (3 << 16)
     );
+  }
+
+  #[test]
+  fn static_vc_runtime_chain() {
+    // 1. Nothing is set, should default to true
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new();
+    assert!(crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 2. Set to anything but "false" in env, should be true
+    unsafe { std::env::set_var("STATIC_VCRUNTIME", "qweqe") };
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new();
+    assert!(crate::should_static_link_vc_runtime(&config, &attributes));
+    unsafe { std::env::remove_var("STATIC_VCRUNTIME") };
+
+    // 3. Set to "false" in env, should be false
+    unsafe { std::env::set_var("STATIC_VCRUNTIME", "false") };
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new();
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+    unsafe { std::env::remove_var("STATIC_VCRUNTIME") };
+
+    // 4. Set to true in attributes, should be true
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new()
+      .windows_attributes(crate::WindowsAttributes::new().static_vc_runtime(true));
+    assert!(crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 5. Set to false in attributes, should be false
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new()
+      .windows_attributes(crate::WindowsAttributes::new().static_vc_runtime(false));
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 6. Set to true in config, should be true
+    let config = tauri_utils::config::Config {
+      build: tauri_utils::config::BuildConfig {
+        windows: tauri_utils::config::WindowsBuildConfig {
+          static_vc_runtime: true,
+        },
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let attributes = crate::Attributes::new();
+    assert!(crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 7. Set to false in config, should be false
+    let config = tauri_utils::config::Config {
+      build: tauri_utils::config::BuildConfig {
+        windows: tauri_utils::config::WindowsBuildConfig {
+          static_vc_runtime: false,
+        },
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let attributes = crate::Attributes::new();
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 8. Set to true in config and false in attributes, should be false because attributes takes precedence over config
+    let config = tauri_utils::config::Config {
+      build: tauri_utils::config::BuildConfig {
+        windows: tauri_utils::config::WindowsBuildConfig {
+          static_vc_runtime: true,
+        },
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let attributes = crate::Attributes::new()
+      .windows_attributes(crate::WindowsAttributes::new().static_vc_runtime(false));
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 9. Set to false in env and true in attributes, should be false because env takes precedence over attributes
+    unsafe { std::env::set_var("STATIC_VCRUNTIME", "false") };
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new()
+      .windows_attributes(crate::WindowsAttributes::new().static_vc_runtime(true));
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+    unsafe { std::env::remove_var("STATIC_VCRUNTIME") };
   }
 }

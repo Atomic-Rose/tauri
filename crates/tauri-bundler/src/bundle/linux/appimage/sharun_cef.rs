@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use std::{ffi::OsString, fs, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command};
 
 use anyhow::Context;
 
@@ -13,36 +13,6 @@ use crate::{
 };
 
 use super::write_and_make_executable;
-
-fn prune_library_named_directories(app_dir_path: &std::path::Path) -> crate::Result<()> {
-  let lib_dir = app_dir_path.join("shared/lib");
-  if !lib_dir.exists() {
-    return Ok(());
-  }
-
-  let mut candidates = Vec::new();
-  let mut stack = vec![lib_dir];
-  while let Some(dir) = stack.pop() {
-    for entry in fs::read_dir(&dir)? {
-      let entry = entry?;
-      let path = entry.path();
-      let file_type = entry.file_type()?;
-      if file_type.is_dir() {
-        if entry.file_name().to_string_lossy().contains(".so") {
-          candidates.push(path);
-        } else {
-          stack.push(path);
-        }
-      }
-    }
-  }
-
-  for path in candidates {
-    fs::remove_dir_all(path)?;
-  }
-
-  Ok(())
-}
 
 // TODO: Test if bundling xdg-mime makes sense (eg does it even work if it's not on the host system?)
 // TODO: Monitor TLS support / certificates - seems to be working in initial tests
@@ -75,14 +45,14 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
 
   fs::create_dir_all(&tools_path)?;
 
-  // TODO: mirror
   let quick_sharun = tools_path.join("quick-sharun.sh");
-  if !quick_sharun.exists() {
-    let data = download(
-      "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/refs/heads/main/useful-tools/quick-sharun.sh",
-    )?;
-    write_and_make_executable(&quick_sharun, data)?;
-  }
+  // TODO: offline build support
+  // github doesn't send a Last-Modified header
+  // if !quick_sharun.exists() {}
+  let data = download(
+    "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/refs/heads/main/useful-tools/quick-sharun.sh",
+  )?;
+  write_and_make_executable(&quick_sharun, data)?;
 
   let package_dir = settings
     .project_out_directory()
@@ -104,15 +74,25 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     main_binary.set_name(main_binary_name_kebab);
   }
 
+  fs::create_dir_all(&output_path)?;
+  let app_dir_path = output_path.join(format!("{}.AppDir", settings.product_name()));
+
   // generate deb_folder structure
   let (data_dir, icons) = debian::generate_data(&settings, &package_dir)
     .with_context(|| "Failed to build data folders and files")?;
-  fs_utils::copy_custom_files(&settings.appimage().files, &data_dir)
+
+  fs_utils::copy_dir(&data_dir.join("usr/bin/"), &app_dir_path.join("bin/"))
+    .with_context(|| "Failed to copy bin files")?;
+  // Only exists when resources feature is used
+  if data_dir.join("usr/lib/").exists() {
+    fs_utils::copy_dir(&data_dir.join("usr/lib/"), &app_dir_path.join("lib/"))
+      .with_context(|| "Failed to copy lib files")?;
+  }
+
+  fs_utils::copy_custom_files(&settings.appimage().files, &app_dir_path)
     .with_context(|| "Failed to copy custom files")?;
 
-  fs::create_dir_all(data_dir.join("usr/bin/"))?;
-  fs::create_dir_all(data_dir.join("usr/lib/"))?;
-  fs::create_dir_all(data_dir.join("usr/lib/locales"))?;
+  fs::create_dir_all(app_dir_path.join("bin/locales/"))?;
 
   let cef_path = settings
     .bundle_settings()
@@ -143,12 +123,10 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   ];
 
   for f in cef_files {
-    let dest = if f == "chrome-sandbox" {
-      data_dir.join("usr/bin/").join(f)
-    } else {
-      data_dir.join("usr/lib/").join(f)
-    };
-    fs::copy(cef_path.join(f), &dest)?;
+    let dest = app_dir_path.join("bin/").join(f);
+    fs::copy(cef_path.join(f), &dest)
+      .with_context(|| format!("Failed to copy cef file {f} to {}", dest.display()))?;
+    // quick-sharun checks for the NO_STRIP env but libcef.so is 1.5GB so we make sure it's stripped anyway.
     let _ = Command::new("strip").arg(&dest).output_ok();
   }
   let locales = [
@@ -161,12 +139,11 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   for f in locales {
     fs::copy(
       cef_path.join("locales").join(f),
-      data_dir.join("usr/lib/locales").join(f),
-    )?;
+      app_dir_path.join("bin/locales").join(f),
+    )
+    .with_context(|| format!("Failed to copy cef locales file {f}"))?;
   }
 
-  fs::create_dir_all(&output_path)?;
-  let app_dir_path = output_path.join(format!("{}.AppDir", settings.product_name()));
   let appimage_filename = format!(
     "{}_{}_{appimage_arch}.AppImage",
     settings.product_name(),
@@ -191,80 +168,39 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     _ => "",
   };
 
-  let bins = settings.copy_binaries(&app_dir_path.join("usr/bin/"))?;
-  let bins = bins
-    .iter()
-    .map(|b| format!(" \"{}\"", b.to_string_lossy()))
+  // Also intentionally(!) includes cef library files
+  let bins = app_dir_path
+    .join("bin/")
+    .read_dir()?
+    .filter_map(|entry| entry.ok())
+    .map(|entry| format!(" \"{}\"", entry.path().to_string_lossy()))
     .collect::<String>();
 
   // TODO: Consider to not rely on quick-sharun when we have more time
   Command::new("/bin/sh")
     .current_dir(&output_path)
     .env("APPDIR", &app_dir_path)
-    .env("LD_LIBRARY_PATH", {
-      let mut paths = OsString::from(data_dir.join("usr/lib").as_os_str());
-      if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
-        paths.push(":");
-        paths.push(existing);
-      }
-      paths
-    })
-    .env(
-      "LIB_DIR",
-      if std::path::Path::new("/usr/lib64").exists() {
-        "/usr/lib64"
-      } else {
-        "/usr/lib"
-      },
-    )
     .env("OUTNAME", &appimage_filename)
     .env(
       "DESKTOP",
       data_dir.join(format!("usr/share/applications/{product_name}.desktop")),
     )
     .env("ICON", &larger_icon.path)
-    .env("OUTPUT_APPIMAGE", "0")
-    .env("URUNTIME2APPIMAGE_SOURCE", "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/uruntime2appimage.sh")
+    .env("OUTPUT_APPIMAGE", "1")
+    .env("HOOKSRC", "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/hooks")
     .env("DEPLOY_CHROMIUM", "1")
     .env("ADD_HOOKS", "fix-namespaces.hook")
     .args([
       "-c",
       &format!(
-        r#""{}" "{}" {bins} "{}" "{}""#,
+        r#""{}" {bins} "{}""#,
         quick_sharun.to_string_lossy(),
-        data_dir
-          .join(format!("usr/bin/{}", main_binary.name()))
-          .to_string_lossy(),
-        // TODO: This may have to be in lib instead
-        data_dir.join("usr/bin/chrome-sandbox").to_string_lossy(),
-        data_dir.join("usr/lib/").to_string_lossy()
+        // TODO: check if we have to search for binaries/libraries in this folder and manually enter them here
+        app_dir_path.join("lib/").to_string_lossy()
       ),
     ])
     .output_ok()
     .context("quick-sharun command failed to run.")?;
-
-  prune_library_named_directories(&app_dir_path)
-    .context("failed to prune invalid library directories from AppDir")?;
-
-  Command::new("/bin/sh")
-    .current_dir(&output_path)
-    .env("APPDIR", &app_dir_path)
-    .env("OUTNAME", &appimage_filename)
-    .env(
-      "DESKTOP",
-      data_dir.join(format!("usr/share/applications/{product_name}.desktop")),
-    )
-    .env("ICON", &larger_icon.path)
-    .env("URUNTIME2APPIMAGE_SOURCE", "https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/refs/heads/main/useful-tools/uruntime2appimage.sh")
-    .arg(&quick_sharun)
-    .arg("--make-appimage")
-    .output_ok()
-    .context("quick-sharun AppImage command failed to run.")?;
-
-  {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&appimage_path, fs::Permissions::from_mode(0o770)).expect("perms");
-  }
 
   fs::remove_dir_all(package_dir).expect("rmdir");
   Ok(vec![appimage_path])

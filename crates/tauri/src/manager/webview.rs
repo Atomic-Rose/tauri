@@ -6,7 +6,6 @@ use std::{
   borrow::Cow,
   collections::{HashMap, HashSet},
   fmt,
-  fs::create_dir_all,
   sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -263,7 +262,7 @@ impl<R: Runtime> WebviewManager<R> {
       let web_resource_request_handler = pending.web_resource_request_handler.take();
       let protocol = crate::protocol::tauri::get(
         manager.manager_owned(),
-        &window_origin,
+        window_origin.clone(),
         web_resource_request_handler,
       );
       pending.register_uri_scheme_protocol("tauri", move |webview_id, request, responder| {
@@ -555,13 +554,6 @@ impl<R: Runtime> WebviewManager<R> {
       }
     }
 
-    // make sure the directory is created and available to prevent a panic
-    if let Some(user_data_dir) = &pending.webview_attributes.data_directory
-      && !user_data_dir.exists()
-    {
-      create_dir_all(user_data_dir)?;
-    }
-
     #[cfg(all(desktop, not(target_os = "windows")))]
     if pending.webview_attributes.zoom_hotkeys_enabled {
       #[derive(Template)]
@@ -672,7 +664,9 @@ impl<R: Runtime> WebviewManager<R> {
     {
       webview
         .with_webview(|w| {
-          unsafe { crate::ios::on_webview_created(w.inner() as _, w.view_controller() as _) };
+          if let Some(w) = w.as_any().downcast_ref::<tauri_runtime_wry::Webview>() {
+            unsafe { crate::ios::on_webview_created(w.inner() as _, w.view_controller() as _) };
+          }
         })
         .expect("failed to run on_webview_created hook");
     }

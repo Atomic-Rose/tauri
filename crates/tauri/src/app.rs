@@ -672,7 +672,7 @@ impl<R: Runtime> AppHandle<R> {
   #[cfg(target_os = "ios")]
   pub fn supports_multiple_windows(&self) -> bool {
     let (tx, rx) = std::sync::mpsc::channel();
-    self.run_on_main_thread(move || unsafe {
+    let _ = self.run_on_main_thread(move || unsafe {
       let mtm = objc2::MainThreadMarker::new().unwrap();
       let ui_application = objc2_ui_kit::UIApplication::sharedApplication(mtm);
       tx.send(ui_application.supportsMultipleScenes()).unwrap();
@@ -1028,6 +1028,10 @@ macro_rules! shared_app_impl {
       ///
       /// If a window was not created with an explicit menu or had one set explicitly,
       /// this will hide the menu from it.
+      ///
+      /// ## Platform-specific:
+      ///
+      /// - **macOS:** Unsupported.
       #[cfg(desktop)]
       pub fn hide_menu(&self) -> crate::Result<()> {
         #[cfg(not(target_os = "macos"))]
@@ -1049,6 +1053,10 @@ macro_rules! shared_app_impl {
       ///
       /// If a window was not created with an explicit menu or had one set explicitly,
       /// this will show the menu for it.
+      ///
+      /// ## Platform-specific:
+      ///
+      /// - **macOS:** Unsupported.
       #[cfg(desktop)]
       pub fn show_menu(&self) -> crate::Result<()> {
         #[cfg(not(target_os = "macos"))]
@@ -1661,6 +1669,20 @@ impl Builder<crate::Cef> {
           .collect::<Vec<_>>(),
       },
     );
+    self
+  }
+
+  /// Sets the disk cache directory for CEF (`Settings::cache_path`).
+  ///
+  /// Calling this more than once keeps the path from the last call.
+  /// If omitted, the cache defaults to `{user cache directory}/{identifier}/cef`.
+  #[cfg(feature = "cef")]
+  pub fn root_cache_path<P: AsRef<std::path::Path>>(mut self, path: P) -> Self {
+    self
+      .platform_specific_attributes
+      .push(tauri_runtime_cef::RuntimeInitAttribute::CachePath {
+        path: path.as_ref().to_path_buf(),
+      });
     self
   }
 }
@@ -2431,6 +2453,15 @@ tauri::Builder::<tauri::Wry>::new()
     #[cfg(not(any(windows, target_os = "linux")))]
     let mut runtime = R::new(runtime_args)?;
 
+    // Start the deferred resolved-ACL build now that the runtime exists. The builder was set up
+    // (not spawned) at `generate_context!()` time; spawning it here keeps ACL construction off
+    // the startup critical path — it overlaps webview creation and frontend boot — while
+    // guaranteeing no builder thread allocates *during* runtime init. That matters for runtimes
+    // that replace the process allocator in `new` (CEF loads the Chromium framework, swapping
+    // macOS's default malloc zone): an allocation racing the swap corrupts the heap and crashes
+    // at startup. See `RuntimeAuthority::new_async` / `begin_build`.
+    manager.runtime_authority.lock().unwrap().begin_build();
+
     #[cfg(desktop)]
     {
       // setup menu event handler
@@ -2506,11 +2537,9 @@ tauri::Builder::<tauri::Wry>::new()
     {
       let config = app.config();
       if let Some(tray_config) = &config.app.tray_icon {
-        #[allow(deprecated)]
         let mut tray =
           TrayIconBuilder::with_id(tray_config.id.clone().unwrap_or_else(|| "main".into()))
             .icon_as_template(tray_config.icon_as_template)
-            .menu_on_left_click(tray_config.menu_on_left_click)
             .show_menu_on_left_click(tray_config.show_menu_on_left_click);
         if let Some(icon) = &app.manager.tray.icon {
           tray = tray.icon(icon.clone());

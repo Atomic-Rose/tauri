@@ -217,14 +217,6 @@ use std::{
 };
 use utils::assets::{AssetKey, CspHash, EmbeddedAssets};
 
-#[cfg(feature = "wry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "wry")))]
-pub use tauri_runtime_wry::webview_version;
-
-#[cfg(feature = "cef")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cef")))]
-pub use tauri_runtime_cef::webview_version;
-
 #[cfg(target_os = "macos")]
 #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
 pub use runtime::ActivationPolicy;
@@ -333,6 +325,22 @@ pub use pattern::Pattern;
 /// Whether we are running in development mode or not.
 pub const fn is_dev() -> bool {
   !cfg!(feature = "custom-protocol")
+}
+
+// TODO: Fix the error types
+/// Get WebView/Webkit version on current platform.
+pub fn webview_version() -> Result<String> {
+  #[cfg(feature = "cef")]
+  if let Ok(v) = tauri_runtime_cef::webview_version() {
+    return Ok(v);
+  }
+
+  #[cfg(feature = "wry")]
+  if let Ok(v) = tauri_runtime_wry::webview_version() {
+    return Ok(v);
+  }
+
+  Ok("0.0.0".to_string())
 }
 
 /// Represents a container of file assets that are retrievable during runtime.
@@ -689,7 +697,7 @@ pub trait Manager<R: Runtime>: sealed::ManagerBase<R> {
   ///
   /// #[tauri::command]
   /// fn string_command<'r>(state: State<'r, MyString>) {
-  ///     println!("state: {}", state.inner().0);
+  ///     println!("state: {}", state.0);
   /// }
   ///
   /// tauri::Builder::<tauri::Wry>::new()
@@ -779,13 +787,14 @@ pub trait Manager<R: Runtime>: sealed::ManagerBase<R> {
 
   /// Gets the managed [`Env`].
   fn env(&self) -> Env {
-    self.state::<Env>().inner().clone()
+    use std::ops::Deref;
+    self.state::<Env>().deref().clone()
   }
 
   /// Gets the scope for the asset protocol.
   #[cfg(feature = "protocol-asset")]
   fn asset_protocol_scope(&self) -> scope::fs::Scope {
-    self.state::<Scopes>().inner().asset_protocol.clone()
+    self.state::<Scopes>().asset_protocol.clone()
   }
 
   /// The path resolver.
@@ -1094,16 +1103,19 @@ pub(crate) mod sealed {
   }
 }
 
+#[cfg(desktop)]
 struct UnsafeSend<T>(T);
+#[cfg(desktop)]
 unsafe impl<T> Send for UnsafeSend<T> {}
 
+#[cfg(desktop)]
 impl<T> UnsafeSend<T> {
   fn take(self) -> T {
     self.0
   }
 }
 
-#[allow(unused)]
+#[cfg(desktop)]
 macro_rules! run_main_thread {
   ($handle:ident, $ex:expr) => {{
     use std::sync::mpsc::channel;
@@ -1118,7 +1130,7 @@ macro_rules! run_main_thread {
   }};
 }
 
-#[allow(unused)]
+#[cfg(desktop)]
 pub(crate) use run_main_thread;
 
 #[cfg(any(test, feature = "test"))]
