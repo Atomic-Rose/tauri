@@ -171,12 +171,9 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     app_dir_path.join(larger_icon_path),
     app_dir_path.join(format!("{product_name}.png")),
   )?;
+  std::os::unix::fs::symlink(format!("{product_name}.png"), app_dir_path.join(".DirIcon"))?;
   std::os::unix::fs::symlink(
-    app_dir_path.join(format!("{product_name}.png")),
-    app_dir_path.join(".DirIcon"),
-  )?;
-  std::os::unix::fs::symlink(
-    app_dir_path.join(format!("usr/share/applications/{product_name}.desktop")),
+    format!("usr/share/applications/{product_name}.desktop"),
     app_dir_path.join(format!("{product_name}.desktop")),
   )?;
 
@@ -232,7 +229,7 @@ fn prepare_tools(tools_path: &Path, arch: &str, verbose: bool) -> crate::Result<
     write_and_make_executable(&apprun, data)?;
   }
 
-  let linuxdeploy_arch = if arch == "i686" { "i383" } else { arch };
+  let linuxdeploy_arch = if arch == "i686" { "i386" } else { arch };
   let linuxdeploy = tools_path.join(format!("linuxdeploy-{linuxdeploy_arch}.AppImage"));
   if !linuxdeploy.exists() {
     let data = download(&format!(

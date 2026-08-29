@@ -115,20 +115,6 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
 
   settings.copy_resources(&resources_dir)?;
 
-  let bin_paths = settings
-    .copy_binaries(&bin_dir)
-    .with_context(|| "Failed to copy external binaries")?;
-  sign_paths.extend(bin_paths.into_iter().map(|path| SignTarget {
-    path,
-    is_an_executable: true,
-  }));
-
-  let bin_paths = copy_binaries_to_bundle(&bundle_directory, settings)?;
-  sign_paths.extend(bin_paths.into_iter().map(|path| SignTarget {
-    path,
-    is_an_executable: true,
-  }));
-
   copy_custom_files_to_bundle(&bundle_directory, settings)?;
 
   // Handle CEF support if cef_path is set
@@ -147,6 +133,23 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
       &mut sign_paths,
     );
   }
+
+  // Sign CEF nested code first (helper apps/framework internals), then top-level binaries.
+  // Signing the main executable before CEF helpers causes codesign to fail with:
+  // "code object is not signed at all ... In subcomponent: ... Helper (Renderer).app".
+  let bin_paths = settings
+    .copy_binaries(&bin_dir)
+    .with_context(|| "Failed to copy external binaries")?;
+  sign_paths.extend(bin_paths.into_iter().map(|path| SignTarget {
+    path,
+    is_an_executable: true,
+  }));
+
+  let bin_paths = copy_binaries_to_bundle(&bundle_directory, settings)?;
+  sign_paths.extend(bin_paths.into_iter().map(|path| SignTarget {
+    path,
+    is_an_executable: true,
+  }));
 
   if settings.no_sign() {
     log::warn!("Skipping signing due to --no-sign flag.",);
@@ -297,103 +300,14 @@ fn create_info_plist(
     plist.insert("LSMinimumSystemVersion".into(), version.into());
   }
 
-  if let Some(associations) = settings.file_associations() {
-    let exported_associations = associations
-      .iter()
-      .filter_map(|association| {
-        association.exported_type.as_ref().map(|exported_type| {
-          let mut dict = plist::Dictionary::new();
-
-          dict.insert(
-            "UTTypeIdentifier".into(),
-            exported_type.identifier.clone().into(),
-          );
-          if let Some(description) = &association.description {
-            dict.insert("UTTypeDescription".into(), description.clone().into());
-          }
-          if let Some(conforms_to) = &exported_type.conforms_to {
-            dict.insert(
-              "UTTypeConformsTo".into(),
-              plist::Value::Array(conforms_to.iter().map(|s| s.clone().into()).collect()),
-            );
-          }
-
-          let mut specification = plist::Dictionary::new();
-          specification.insert(
-            "public.filename-extension".into(),
-            plist::Value::Array(
-              association
-                .ext
-                .iter()
-                .map(|s| s.to_string().into())
-                .collect(),
-            ),
-          );
-          if let Some(mime_type) = &association.mime_type {
-            specification.insert("public.mime-type".into(), mime_type.clone().into());
-          }
-
-          dict.insert("UTTypeTagSpecification".into(), specification.into());
-
-          plist::Value::Dictionary(dict)
-        })
-      })
-      .collect::<Vec<_>>();
-
-    if !exported_associations.is_empty() {
-      plist.insert(
-        "UTExportedTypeDeclarations".into(),
-        plist::Value::Array(exported_associations),
-      );
+  if let Some(associations) = settings.file_associations()
+    && let Some(file_associations_plist) =
+      tauri_utils::config::file_associations_plist(associations)
+    && let Some(plist_dict) = file_associations_plist.as_dictionary()
+  {
+    for (key, value) in plist_dict {
+      plist.insert(key.clone(), value.clone());
     }
-
-    plist.insert(
-      "CFBundleDocumentTypes".into(),
-      plist::Value::Array(
-        associations
-          .iter()
-          .map(|association| {
-            let mut dict = plist::Dictionary::new();
-
-            if !association.ext.is_empty() {
-              dict.insert(
-                "CFBundleTypeExtensions".into(),
-                plist::Value::Array(
-                  association
-                    .ext
-                    .iter()
-                    .map(|ext| ext.to_string().into())
-                    .collect(),
-                ),
-              );
-            }
-
-            if let Some(content_types) = &association.content_types {
-              dict.insert(
-                "LSItemContentTypes".into(),
-                plist::Value::Array(content_types.iter().map(|s| s.to_string().into()).collect()),
-              );
-            }
-
-            dict.insert(
-              "CFBundleTypeName".into(),
-              association
-                .name
-                .as_ref()
-                .unwrap_or(&association.ext[0].0)
-                .to_string()
-                .into(),
-            );
-            dict.insert(
-              "CFBundleTypeRole".into(),
-              association.role.to_string().into(),
-            );
-            dict.insert("LSHandlerRank".into(), association.rank.to_string().into());
-            plist::Value::Dictionary(dict)
-          })
-          .collect(),
-      ),
-    );
   }
 
   if let Some(path) = bundle_icon_file {

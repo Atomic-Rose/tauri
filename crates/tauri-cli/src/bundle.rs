@@ -43,7 +43,7 @@ impl ValueEnum for BundleFormat {
   }
 
   fn to_possible_value(&self) -> Option<PossibleValue> {
-    let hide = self.0 == PackageType::Updater;
+    let hide = (!cfg!(windows) && self.0 == PackageType::Nsis) || self.0 == PackageType::Updater;
     Some(PossibleValue::new(self.0.short_name()).hide(hide))
   }
 }
@@ -207,7 +207,7 @@ pub fn bundle<A: AppSettings>(
       package_types,
       dirs.tauri,
     )
-    .with_context(|| "failed to build bundler settings")?;
+    .context("failed to build bundler settings")?;
   settings.set_no_sign(options.no_sign);
 
   settings.set_log_level(match verbosity {
@@ -216,7 +216,7 @@ pub fn bundle<A: AppSettings>(
     _ => log::Level::Trace,
   });
 
-  let bundles = tauri_bundler::bundle_project(&settings).map_err(Box::new)?;
+  let bundles = tauri_bundler::bundle_project(&settings)?;
 
   sign_updaters(settings, bundles, ci)?;
 

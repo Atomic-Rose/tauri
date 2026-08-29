@@ -6,7 +6,6 @@ use std::{
   borrow::Cow,
   collections::{HashMap, HashSet},
   fmt,
-  fs::create_dir_all,
   sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -28,6 +27,9 @@ use crate::{
   webview::PageLoadPayload,
 };
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use crate::app::OnWebContentProcessTerminate;
+
 use super::{
   window::{DRAG_DROP_EVENT, DRAG_ENTER_EVENT, DRAG_LEAVE_EVENT, DRAG_OVER_EVENT, DragDropPayload},
   {AppManager, EmitPayload},
@@ -37,7 +39,7 @@ use super::{
 // and we do not get a secure context without the custom protocol that proxies to the dev server
 // additionally, we need the custom protocol to inject the initialization scripts on Android
 // must also keep in sync with the `let mut response` assignment in prepare_uri_scheme_protocol
-pub(crate) const PROXY_DEV_SERVER: bool = cfg!(all(dev, any(mobile, feature = "cef")));
+pub(crate) const PROXY_DEV_SERVER: bool = cfg!(all(dev, any(mobile)));
 
 pub(crate) const PROCESS_IPC_MESSAGE_FN: &str =
   include_str!("../../scripts/process-ipc-message-fn.js");
@@ -70,6 +72,9 @@ pub struct WebviewManager<R: Runtime> {
   pub invoke_handler: Box<InvokeHandler<R>>,
   /// The page load hook, invoked when the webview performs a navigation.
   pub on_page_load: Option<Arc<OnPageLoad<R>>>,
+  /// The web content process termination hook.
+  #[cfg(any(target_os = "macos", target_os = "ios"))]
+  pub on_web_content_process_terminate: Option<Arc<OnWebContentProcessTerminate<R>>>,
   /// The webview protocols available to all webviews.
   pub uri_scheme_protocols: Mutex<HashMap<String, Arc<UriSchemeProtocol<R>>>>,
   /// Webview event listeners to all webviews.
@@ -257,7 +262,7 @@ impl<R: Runtime> WebviewManager<R> {
       let web_resource_request_handler = pending.web_resource_request_handler.take();
       let protocol = crate::protocol::tauri::get(
         manager.manager_owned(),
-        &window_origin,
+        window_origin.clone(),
         web_resource_request_handler,
       );
       pending.register_uri_scheme_protocol("tauri", move |webview_id, request, responder| {
@@ -298,6 +303,28 @@ impl<R: Runtime> WebviewManager<R> {
           handler(url, event);
         }
       }));
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if pending.on_web_content_process_terminate_handler.is_none() {
+      let app_manager_ = manager.manager_owned();
+      if app_manager_
+        .webview
+        .on_web_content_process_terminate
+        .is_some()
+      {
+        let label_ = pending.label.clone();
+        pending
+          .on_web_content_process_terminate_handler
+          .replace(Box::new(move || {
+            if let Some(w) = app_manager_.get_webview(&label_)
+              && let Some(on_web_content_process_terminate) =
+                &app_manager_.webview.on_web_content_process_terminate
+            {
+              on_web_content_process_terminate(&w);
+            }
+          }));
+      }
+    }
 
     #[cfg(feature = "protocol-asset")]
     if !registered_scheme_protocols.contains(&"asset".into()) {
@@ -474,8 +501,8 @@ impl<R: Runtime> WebviewManager<R> {
       let html = String::from_utf8_lossy(&body).into_owned();
       // naive way to check if it's an html
       if html.contains('<') && html.contains('>') {
-        let document = tauri_utils::html::parse(html);
-        tauri_utils::html::inject_csp(&document, &csp.to_string());
+        let document = tauri_utils::html2::parse(html);
+        tauri_utils::html2::inject_csp(&document, &csp.to_string());
         url.set_path(&format!("{},{document}", mime::TEXT_HTML));
       }
     }
@@ -525,13 +552,6 @@ impl<R: Runtime> WebviewManager<R> {
       if let Ok(user_data_dir) = local_app_data {
         pending.webview_attributes.data_directory = Some(user_data_dir);
       }
-    }
-
-    // make sure the directory is created and available to prevent a panic
-    if let Some(user_data_dir) = &pending.webview_attributes.data_directory
-      && !user_data_dir.exists()
-    {
-      create_dir_all(user_data_dir)?;
     }
 
     #[cfg(all(desktop, not(target_os = "windows")))]
@@ -644,7 +664,9 @@ impl<R: Runtime> WebviewManager<R> {
     {
       webview
         .with_webview(|w| {
-          unsafe { crate::ios::on_webview_created(w.inner() as _, w.view_controller() as _) };
+          if let Some(w) = w.as_any().downcast_ref::<tauri_runtime_wry::Webview>() {
+            unsafe { crate::ios::on_webview_created(w.inner() as _, w.view_controller() as _) };
+          }
         })
         .expect("failed to run on_webview_created hook");
     }

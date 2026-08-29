@@ -18,9 +18,11 @@ use tauri::{
 use tauri::{Manager, RunEvent};
 use tauri_plugin_sample::{PingRequest, SampleExt};
 
-#[cfg(feature = "cef")]
+#[cfg(test)]
+type TauriRuntime = tauri::test::MockRuntime;
+#[cfg(all(not(test), feature = "cef"))]
 type TauriRuntime = tauri::Cef;
-#[cfg(not(feature = "cef"))]
+#[cfg(all(not(test), not(feature = "cef")))]
 type TauriRuntime = tauri::Wry;
 
 #[derive(Clone, Serialize)]
@@ -37,15 +39,14 @@ pub struct PopupMenu<R: Runtime>(#[allow(dead_code)] tauri::menu::Menu<R>);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg_attr(feature = "cef", tauri::cef_entry_point)]
 pub fn run() {
-  run_app(tauri::Builder::<TauriRuntime>::default(), |_app| {});
+  run_app(tauri::Builder::<TauriRuntime>::new(), |_app| {});
 }
 
 pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
   builder: tauri::Builder<TauriRuntime>,
   setup: F,
 ) {
-  #[allow(unused_mut)]
-  let mut builder = builder
+  let builder = builder
     .plugin(
       tauri_plugin_log::Builder::default()
         .level(log::LevelFilter::Info)
@@ -72,7 +73,9 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
           .build()?,
       ));
 
+      #[allow(unused_mut)]
       let mut window_builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+        .disable_drag_drop_handler()
         .on_document_title_changed(|_window, title| {
           println!("document title changed: {title}");
         })
@@ -82,8 +85,10 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
 
       #[cfg(all(desktop, not(test)))]
       {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
         let app_ = app.handle().clone();
-        let mut created_window_count = std::sync::atomic::AtomicUsize::new(0);
+        let created_window_count = AtomicU64::new(0);
 
         window_builder = window_builder
           .title("Tauri API Validation")
@@ -93,9 +98,9 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
           .on_new_window(move |url, features| {
             println!("new window requested: {url:?} {features:?}");
 
-            let number = created_window_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let number = created_window_count.fetch_add(1, Ordering::Relaxed);
 
-            let builder = tauri::WebviewWindowBuilder::new(
+            let builder = WebviewWindowBuilder::new(
               &app_,
               format!("new-{number}"),
               tauri::WebviewUrl::External(if cfg!(feature = "cef") {
@@ -163,37 +168,10 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
           Ok(())
         }),
       });
-      log::info!("got response: {:?}", response);
-      // when #[cfg(desktop)], Rust will detect pattern as irrefutable
-      #[allow(irrefutable_let_patterns)]
+      log::info!("got response: {response:?}");
       if let Ok(res) = response {
         assert_eq!(res.value, value);
       }
-
-      #[cfg(desktop)]
-      std::thread::spawn(|| {
-        let server = match tiny_http::Server::http("localhost:3003") {
-          Ok(s) => s,
-          Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-          }
-        };
-        loop {
-          if let Ok(mut request) = server.recv() {
-            let mut body = Vec::new();
-            let _ = request.as_reader().read_to_end(&mut body);
-            let response = tiny_http::Response::new(
-              tiny_http::StatusCode(200),
-              request.headers().to_vec(),
-              std::io::Cursor::new(body),
-              request.body_length(),
-              None,
-            );
-            let _ = request.respond(response);
-          }
-        }
-      });
 
       setup(app);
 
@@ -229,18 +207,19 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
   #[cfg(target_os = "macos")]
   app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
+  #[cfg(target_os = "ios")]
+  let mut counter = 0;
   app.run(move |_app_handle, _event| {
-    #[cfg(all(desktop, not(test)))]
+    #[cfg(not(test))]
     match &_event {
       #[cfg(not(feature = "cef"))]
-      RunEvent::ExitRequested { api, code, .. } => {
+      RunEvent::ExitRequested { api, code, .. } if code.is_none() => {
         // Keep the event loop running even if all windows are closed
         // This allow us to catch tray icon events when there is no window
         // if we manually requested an exit (code is Some(_)) we will let it go through
-        if code.is_none() {
-          api.prevent_exit();
-        }
+        api.prevent_exit();
       }
+      #[cfg(desktop)]
       RunEvent::WindowEvent {
         event: tauri::WindowEvent::CloseRequested { api, .. },
         label,
@@ -251,10 +230,24 @@ pub fn run_app<F: FnOnce(&App<TauriRuntime>) + Send + 'static>(
         // usually you'd show a dialog here to ask for confirmation or whatever
         api.prevent_close();
         _app_handle
-          .get_webview_window(label)
+          .get_webview_window(&label)
           .unwrap()
           .destroy()
           .unwrap();
+      }
+      #[cfg(target_os = "ios")]
+      RunEvent::SceneRequested { .. } => {
+        counter += 1;
+        WebviewWindowBuilder::new(
+          _app_handle,
+          format!("main-from-scene-{counter}"),
+          WebviewUrl::default(),
+        )
+        .build()
+        .unwrap();
+      }
+      RunEvent::Opened { urls } => {
+        println!("opened urls: {:?}", urls);
       }
       _ => (),
     }

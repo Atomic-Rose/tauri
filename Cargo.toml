@@ -35,6 +35,7 @@ members = [
   "examples/api/src-tauri",
   "examples/api/src-tauri/tauri-plugin-sample",
 ]
+exclude = ["crates/cef-helper"]
 resolver = "2"
 
 [workspace.package]
@@ -44,7 +45,7 @@ repository = "https://github.com/tauri-apps/tauri"
 categories = ["gui", "web-programming"]
 license = "Apache-2.0 OR MIT"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 
 # default to small, optimized workspace release binaries
 [profile.release]
@@ -71,4 +72,3 @@ tauri = { path = "./crates/tauri" }
 tauri-plugin = { path = "./crates/tauri-plugin" }
 tauri-utils = { path = "./crates/tauri-utils" }
 tauri-plugin-log = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "feat/cef" }
-cef-dll-sys = { git = "https://github.com/tauri-apps/cef-rs", branch = "fix/146-location-windows" }

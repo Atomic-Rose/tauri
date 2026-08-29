@@ -242,6 +242,20 @@ pub enum RunEvent<T: UserEvent> {
   },
   /// A custom event defined by the user.
   UserEvent(T),
+  /// Emitted when a scene is requested by the system.
+  ///
+  /// This event is emitted when a scene is requested by the system.
+  /// Scenes created by [`Window::new`] are not emitted with this event.
+  /// It is also not emitted for the main scene.
+  #[cfg(target_os = "ios")]
+  SceneRequested {
+    /// Scene that was requested by the system.
+    scene: objc2::rc::Retained<objc2_ui_kit::UIScene>,
+    /// Options that were used to request the scene.
+    ///
+    /// This lets you determine why the scene was requested.
+    options: objc2::rc::Retained<objc2_ui_kit::UISceneConnectionOptions>,
+  },
 }
 
 /// Action to take when the event loop is about to exit
@@ -424,6 +438,11 @@ pub trait Runtime<T: UserEvent>: Debug + Sized + 'static {
   type EventLoopProxy: EventLoopProxy<T>;
   /// The platform specific webview attributes.
   type PlatformSpecificWebviewAttribute: Send + Sync + 'static;
+  /// The platform webview handle exposed through [`WebviewDispatch::with_webview`].
+  ///
+  /// This is the runtime-specific type the user interacts with to reach the
+  /// underlying platform webview APIs.
+  type Webview: 'static;
   /// The platform specific runtime init arguments. Must implement [`InitAttribute`].
   type PlatformSpecificInitAttribute: InitAttribute + Send + Sync + 'static;
   /// Data about the window that requested the new window for [`PendingWebview::new_window_handler`].
@@ -550,7 +569,10 @@ pub trait WebviewDispatch<T: UserEvent>: Debug + Clone + Send + Sync + Sized + '
   fn on_webview_event<F: Fn(&WebviewEvent) + Send + 'static>(&self, f: F) -> WebviewEventId;
 
   /// Runs a closure with the platform webview object as argument.
-  fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()>;
+  fn with_webview<F: FnOnce(<Self::Runtime as Runtime<T>>::Webview) + Send + 'static>(
+    &self,
+    f: F,
+  ) -> Result<()>;
 
   /// Open the web inspector which is usually called devtools.
   #[cfg(any(debug_assertions, feature = "devtools"))]
@@ -620,6 +642,16 @@ pub trait WebviewDispatch<T: UserEvent>: Debug + Clone + Send + Sync + Sized + '
 
   /// Executes javascript on the window this [`WindowDispatch`] represents.
   fn eval_script<S: Into<String>>(&self, script: S) -> Result<()>;
+
+  /// Evaluate JavaScript with callback function on the webview this [`WebviewDispatch`] represents.
+  /// The evaluation result will be serialized into a JSON string and passed to the callback function.
+  ///
+  /// Exception is ignored because of the limitation on Windows. You can catch it yourself and return as string as a workaround.
+  fn eval_script_with_callback<S: Into<String>>(
+    &self,
+    script: S,
+    callback: impl Fn(String) + Send + 'static,
+  ) -> Result<()>;
 
   /// Moves the webview to the given window.
   fn reparent(&self, window_id: WindowId) -> Result<()>;
@@ -791,6 +823,14 @@ pub trait WindowDispatch<T: UserEvent>: Debug + Clone + Send + Sync + Sized + 's
     target_os = "openbsd"
   ))]
   fn default_vbox(&self) -> Result<gtk::Box>;
+
+  /// Returns the name of the Android activity associated with this window.
+  #[cfg(target_os = "android")]
+  fn activity_name(&self) -> Result<String>;
+
+  /// Returns the identifier of the UIScene tied to this UIWindow.
+  #[cfg(target_os = "ios")]
+  fn scene_identifier(&self) -> Result<String>;
 
   /// Raw window handle.
   fn window_handle(

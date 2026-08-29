@@ -246,7 +246,10 @@ fn generate_control_file(
   // https://www.debian.org/doc/debian-policy/ch-controlfields.html
   let dest_path = control_dir.join("control");
   let mut file = fs_utils::create_file(&dest_path)?;
-  let package = heck::AsKebabCase(settings.product_name());
+  // MUSE fork: derive Package: from main_binary_name so the .deb identifier matches
+  // the installed binary (e.g. "muse-writer"). Upstream kebab-cases product_name,
+  // which produces a styled name (e.g. "MUSE" → "muse").
+  let package = heck::AsKebabCase(settings.main_binary_name()?);
   writeln!(file, "Package: {package}")?;
   writeln!(file, "Version: {}", settings.version_string())?;
   writeln!(file, "Architecture: {arch}")?;
